@@ -61,12 +61,17 @@ async function main(logger: ILogger) {
   );
 
   // GalaDeFi DEX API configuration
-  // NOTE: DEX API is NOT officially supported by Gala. Use on-chain router instead.
-  // This is kept for backward compatibility only.
+  // NOTE: DEX API is NOT officially supported by Gala. Use on-chain router (gSwap SDK) instead.
+  // This is kept for backward compatibility only but should NOT be used for creating swaps.
   const galaDeFiEnabled = (await configuration.getOptionalWithDefault('GALADEFI_ENABLED', 'false')) === 'true';
+  if (galaDeFiEnabled) {
+    logger.warn(
+      'GALADEFI_ENABLED=true is set, but the old DEX API is NOT used for creating swaps. The bot uses the official Gala gSwap SDK (via GALA_RPC_URL) for all swap creation.',
+    );
+  }
   const galaDeFiApiBaseUri = await configuration.getOptionalWithDefault(
     'GALADEFI_API_BASE_URI',
-    'https://dex-backend-prod1.defi.gala.com', // HFT DEX API endpoint
+    'https://dex-backend-prod1.defi.gala.com', // HFT DEX API endpoint (not used for swaps)
   );
 
   // Blockchain RPC Provider (MANDATORY for on-chain trading)

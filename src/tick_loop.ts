@@ -330,10 +330,13 @@ export async function mainLoopTick(
         await reporter.reportCreatingSwap(allTokenValues, swapToCreate);
         await sleep(executionDelay);
 
-        // Use GalaChain router for direct chaincode swaps (official Gala swap) if available
-        // Otherwise fall back to REST API (legacy)
+        // IMPORTANT: Only use official Gala gSwap SDK (via galaChainRouter)
+        // DO NOT use the old DEX API (galaDeFiApi) - it's not officially supported by Gala
+        // DO NOT fallback to REST API (order book) - only use official gSwap SDK
+
         if (options.galaChainRouter) {
           try {
+            // Use official Gala gSwap SDK for direct swaps (executed immediately on-chain)
             const swapResult = await options.galaChainRouter.requestSwap({
               offered: swapToCreate.offered,
               wanted: swapToCreate.wanted,
@@ -343,7 +346,7 @@ export async function mainLoopTick(
                 transactionId: swapResult.transactionId,
                 contractName: options.galaChainRouter.getContractName(),
               },
-              'Swap created and executed on-chain via GalaChain chaincode contract (official Gala swap)',
+              'Swap created and executed on-chain via GalaChain gSwap SDK (official Gala swap)',
             );
             // Note: On-chain swaps via chaincode are executed immediately, so we still track them
             // Convert to IRawSwap format for storage
@@ -360,19 +363,20 @@ export async function mainLoopTick(
           } catch (error) {
             logger.error(
               { error, swapToCreate },
-              'Failed to execute on-chain swap via chaincode, falling back to REST API',
+              'Failed to execute on-chain swap via gSwap SDK. Skipping swap creation (no fallback to REST API).',
             );
-            // Fallback to REST API if chaincode swap fails
-            const createdSwap = await galaSwapApi.createSwap(swapToCreate);
-            await createdSwapStore.addSwap(createdSwap);
+            // Do NOT fallback to REST API - only use official gSwap SDK
+            // Log error and continue to next swap
           }
         } else {
-          // Use REST API (legacy) if GalaChain router is not available
-          logger.warn(
-            'GalaChain router not available, using REST API (legacy). Configure GALA_RPC_URL to use official Gala chaincode swaps.',
+          // GalaChain router is required - do not use REST API fallback
+          logger.error(
+            {
+              swapToCreate,
+            },
+            'GalaChain router not available. Cannot create swap without official gSwap SDK. Configure GALA_RPC_URL to enable swap creation.',
           );
-          const createdSwap = await galaSwapApi.createSwap(swapToCreate);
-          await createdSwapStore.addSwap(createdSwap);
+          // Do NOT create swap via REST API - skip it
         }
       }
 
