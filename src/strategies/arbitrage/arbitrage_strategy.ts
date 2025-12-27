@@ -32,7 +32,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
   private readonly GALA_AMOUNT: number = 5000; // Maximum amount of GALA to trade
   private readonly MIN_PROFIT_GALA: number = 1; // Minimum profit in GALA to execute (any positive profit)
   private readonly MAX_PROFIT_GALA: number = 30; // Maximum expected profit
-  private readonly ALLOW_LOSS_TRADES: boolean = true; // Allow executing trades even at a loss (for testing/learning)
+  private readonly ALLOW_LOSS_TRADES: boolean = false; // Only execute trades when profitable
   // Binance fees: Market orders = 0.1%, Limit maker orders = 0.02% (80% savings!)
   private readonly BINANCE_MARKET_FEE_RATE: number = 0.001; // 0.1% for market orders (current)
   private readonly BINANCE_MAKER_FEE_RATE: number = 0.0002; // 0.02% for limit maker orders (future optimization)
