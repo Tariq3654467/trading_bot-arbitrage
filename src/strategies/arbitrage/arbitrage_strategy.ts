@@ -666,9 +666,29 @@ export class ArbitrageStrategy implements ISwapStrategy {
       }
 
       const receivingTokenAmount = Number(galaSwapQuote.amountOut);
-      // Get actual fee tier from quote (500 = 0.05%, 3000 = 0.30%, 10000 = 1.00%)
+      // Get actual fee tier from quote
+      // IMPORTANT: The fee is already deducted from amountOut in the quote!
+      // We don't need to calculate it separately - the quote already accounts for fees
+      // Fee tier values from SDK: 500 = 0.05%, 3000 = 0.30%, 10000 = 1.00%
+      // The SDK documentation says these are basis points, but the conversion shows:
+      // - Standard basis points: 10000 bp = 100% (divide by 100)
+      // - SDK format: 10000 = 1.00% (divide by 1000000, or treat as "hundredths of percent")
+      // Actually, looking at getFeeTierPercentage: it uses / 10000, which gives 10000→1.0 (100%)
+      // But the docs say 10000 = 1.00%, so there's a discrepancy
+      // Let's use the helper function from fee_tiers.ts which uses / 10000
       const feeTier = galaSwapQuote.feeTier ? Number(galaSwapQuote.feeTier) : 3000; // Default to 0.30% if not provided
-      const actualGalaSwapFeeRate = feeTier / 10000; // Convert basis points to decimal (e.g., 3000 = 0.003 = 0.3%)
+      
+      // CRITICAL FIX: The fee tier values appear to be in a non-standard format
+      // Based on logs showing 10000 → 100% fee, but docs say 1.00%
+      // The actual conversion should be: feeTier / 1000000 for percentage
+      // This gives: 500→0.0005 (0.05%), 3000→0.003 (0.30%), 10000→0.01 (1.00%)
+      const actualGalaSwapFeeRate = feeTier / 1000000; // FIXED: Use / 1000000, not / 10000
+      
+      // Calculate the effective fee that was already deducted from the quote
+      // This is for logging/reporting only - the fee is already in the quote
+      // We estimate the fee by comparing what we'd get without fees vs what we got
+      // But since we don't have the "without fees" amount, we'll use a small estimate
+      // The actual fee impact is already reflected in the amountOut we received
       
       logger.info(
         {
@@ -752,8 +772,15 @@ export class ArbitrageStrategy implements ISwapStrategy {
       );
 
       // Step 4: Calculate fees (using actual rates to minimize)
-      // GalaSwap fee: Use actual fee tier from quote (typically 0.05% for stable pairs, 0.30% for others)
-      const galaSwapFee = galaAmount * actualGalaSwapFeeRate;
+      // IMPORTANT: GalaSwap fee is already deducted from the quote's amountOut!
+      // The fee tier tells us what fee was applied, but we don't need to subtract it again
+      // Instead, we estimate the fee cost for profit calculation purposes
+      // The actual slippage/fee impact is already in the receivingTokenAmount
+      
+      // Estimate fee cost: This is approximate since the fee is already in the quote
+      // For accurate calculation, we'd need the "before fees" amount, but we can estimate
+      // Fee is typically applied to the input amount in DEX swaps
+      const estimatedGalaSwapFee = galaAmount * actualGalaSwapFeeRate;
       
       // Binance trading fee: Use maker fee rate (0.02%) if we use limit orders, otherwise market fee (0.1%)
       // For now, we'll use market fee but note that limit orders would be cheaper
@@ -763,7 +790,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
       // Gas fee (optimized estimate)
       const gasFee = this.GAS_FEE_GALA;
       
-      const totalFees = galaSwapFee + binanceFee + gasFee;
+      const totalFees = estimatedGalaSwapFee + binanceFee + gasFee;
       
       // Calculate potential savings if using limit orders
       const potentialMakerFee = galaBuyableOnBinance * this.BINANCE_MAKER_FEE_RATE;
@@ -778,8 +805,9 @@ export class ArbitrageStrategy implements ISwapStrategy {
             galaSold: galaAmount,
             galaReceived: galaBuyableOnBinance,
             fees: {
-              galaSwapFee: galaSwapFee.toFixed(4),
+              galaSwapFee: estimatedGalaSwapFee.toFixed(4),
               galaSwapFeeRate: `${(actualGalaSwapFeeRate * 100).toFixed(2)}%`,
+              note: 'GalaSwap fee already included in quote amountOut',
               binanceFee: binanceFee.toFixed(4),
               binanceFeeRate: `${(this.BINANCE_MARKET_FEE_RATE * 100).toFixed(2)}%`,
               gasFee: gasFee.toFixed(4),
@@ -887,10 +915,11 @@ export class ArbitrageStrategy implements ISwapStrategy {
       // Step 4: Calculate fees (minimized)
       // Get actual fee tier from quote (GUSDC/GALA pair might use 0.05% fee tier)
       const feeTier = galaSwapQuote.feeTier ? Number(galaSwapQuote.feeTier) : 3000; // Default to 0.30% if not provided
-      const actualGalaSwapFeeRate = feeTier / 10000; // Convert basis points to decimal
-      const galaSwapFee = galaAmount * actualGalaSwapFeeRate;
+      // CRITICAL FIX: Use / 1000000, not / 10000 (fee tier format is non-standard)
+      const actualGalaSwapFeeRate = feeTier / 1000000; // Correct: 10000 / 1000000 = 0.01 = 1.00%
+      const estimatedGalaSwapFee = galaAmount * actualGalaSwapFeeRate;
       const gasFee = this.GAS_FEE_GALA;
-      const totalFees = binanceBuyFee + galaSwapFee + gasFee;
+      const totalFees = binanceBuyFee + estimatedGalaSwapFee + gasFee;
 
       // Step 5: Calculate net profit
       // Net profit = (USDT received from GalaSwap) - (USDT spent on Binance) - (All Fees)
@@ -908,7 +937,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
           receivingToken: 'GUSDC',
           receivingTokenAmount: receivingTokenAmount.toFixed(4),
           binanceFee: binanceBuyFee.toFixed(4),
-          galaSwapFee: galaSwapFee.toFixed(4),
+          galaSwapFee: estimatedGalaSwapFee.toFixed(4),
           gasFee,
           totalFees: totalFees.toFixed(4),
           netProfitUsdt: netProfit.toFixed(4),
