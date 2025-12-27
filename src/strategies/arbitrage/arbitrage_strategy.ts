@@ -47,6 +47,10 @@ export class ArbitrageStrategy implements ISwapStrategy {
   
   private lastArbitrageCheck: number = 0;
   private readonly ARBITRAGE_CHECK_INTERVAL: number = 60000; // Check every 60 seconds
+  private gwethFailureCount: number = 0; // Track consecutive GWETH failures
+  private readonly GWETH_MAX_FAILURES: number = 3; // Skip GWETH after 3 consecutive failures
+  private gwethLastFailureTime: number = 0;
+  private readonly GWETH_RETRY_INTERVAL: number = 300000; // Retry GWETH after 5 minutes
 
   async doTick(
     logger: ILogger,
@@ -159,6 +163,23 @@ export class ArbitrageStrategy implements ISwapStrategy {
         direction: string;
       }> = [];
 
+      // Check if we should skip GWETH due to recent failures (circuit breaker)
+      const now = Date.now();
+      const shouldSkipGweth = this.gwethFailureCount >= this.GWETH_MAX_FAILURES && 
+                              (now - this.gwethLastFailureTime) < this.GWETH_RETRY_INTERVAL;
+      
+      if (shouldSkipGweth) {
+        logger.debug(
+          {
+            failureCount: this.gwethFailureCount,
+            lastFailureTime: new Date(this.gwethLastFailureTime).toISOString(),
+            retryAfter: new Date(this.gwethLastFailureTime + this.GWETH_RETRY_INTERVAL).toISOString(),
+            note: 'GWETH pool has insufficient liquidity. Skipping GWETH checks temporarily.',
+          },
+          'Skipping GWETH arbitrage checks (circuit breaker active)',
+        );
+      }
+
       // Try each trade size to find the most profitable opportunity
       for (const tradeSize of validSizes) {
         logger.debug(
@@ -169,55 +190,59 @@ export class ArbitrageStrategy implements ISwapStrategy {
           'Trying arbitrage with trade size',
         );
 
-        // Try GALA/GWETH first (primary pair)
-        // Note: GWETH pool has very low liquidity, so we try smaller amounts first
-        let arbitrageOpportunity = await this.checkArbitrageOpportunity(
-          logger,
-          options.binanceApi,
-          options.galaChainRouter,
-          tradeSize,
-          'GALA',
-          'GWETH',
-          'GALAETH',
-          'ETHUSDT',
-        );
+        // Try GALA/GWETH first (primary pair) - but only if circuit breaker is not active
+        let arbitrageOpportunity: ReturnType<typeof this.checkArbitrageOpportunity> extends Promise<infer T> ? T : null = null;
+        
+        if (!shouldSkipGweth) {
+          // Try GWETH with the main trade size first
+          arbitrageOpportunity = await this.checkArbitrageOpportunity(
+            logger,
+            options.binanceApi,
+            options.galaChainRouter,
+            tradeSize,
+            'GALA',
+            'GWETH',
+            'GALAETH',
+            'ETHUSDT',
+          );
 
-        // If GALA/GWETH fails due to liquidity, try even smaller amounts for GWETH
-        // GWETH pool has very low liquidity, so we need to try smaller sizes
-        if (!arbitrageOpportunity && tradeSize >= 500) {
-          const smallerSizes = [100, 200, 300, 400, 500].filter(s => s <= availableGala.toNumber() && s < tradeSize);
-          for (const smallerSize of smallerSizes) {
-            logger.debug(
-              {
-                originalSize: tradeSize,
-                tryingSmaller: smallerSize,
-                reason: 'GWETH pool has low liquidity, trying smaller amount',
-              },
-              'Trying smaller trade size for GWETH due to liquidity constraints',
-            );
-            
-            arbitrageOpportunity = await this.checkArbitrageOpportunity(
-              logger,
-              options.binanceApi,
-              options.galaChainRouter,
-              smallerSize,
-              'GALA',
-              'GWETH',
-              'GALAETH',
-              'ETHUSDT',
-            );
-            
-            if (arbitrageOpportunity) {
+          // If GWETH fails due to CONFLICT (liquidity), increment failure counter
+          // Note: We check if the opportunity is null, which means it failed
+          // A successful quote (even if unprofitable) means the pool has liquidity
+          if (!arbitrageOpportunity) {
+            this.gwethFailureCount++;
+            this.gwethLastFailureTime = now;
+            if (this.gwethFailureCount >= this.GWETH_MAX_FAILURES) {
+              logger.warn(
+                {
+                  failureCount: this.gwethFailureCount,
+                  maxFailures: this.GWETH_MAX_FAILURES,
+                  retryAfter: new Date(now + this.GWETH_RETRY_INTERVAL).toISOString(),
+                  note: 'GWETH pool has insufficient liquidity. Will skip GWETH checks for 5 minutes.',
+                },
+                'GWETH circuit breaker activated - skipping GWETH checks',
+              );
+            } else {
+              logger.debug(
+                {
+                  failureCount: this.gwethFailureCount,
+                  maxFailures: this.GWETH_MAX_FAILURES,
+                },
+                'GWETH arbitrage check failed (liquidity issue)',
+              );
+            }
+          } else {
+            // Reset failure counter on success (even if unprofitable, getting a quote means liquidity exists)
+            if (this.gwethFailureCount > 0) {
               logger.info(
                 {
-                  originalSize: tradeSize,
-                  successfulSize: smallerSize,
-                  reason: 'GWETH pool can only handle smaller trades',
+                  previousFailures: this.gwethFailureCount,
+                  note: 'GWETH pool now has liquidity - resetting failure counter',
                 },
-                'Found GWETH opportunity with smaller trade size',
+                'GWETH arbitrage check succeeded (circuit breaker reset)',
               );
-              break; // Found a working size, stop trying smaller ones
             }
+            this.gwethFailureCount = 0;
           }
         }
 
@@ -418,19 +443,23 @@ export class ArbitrageStrategy implements ISwapStrategy {
             opp.netProfit > best.netProfit ? opp : best
           );
           
-          logger.info(
+          logger.warn(
             {
               opportunitiesChecked: allOpportunities.length,
               bestOpportunity: {
                 tradeSize: bestUnprofitable.tradeSize,
-                netProfit: bestUnprofitable.netProfit.toFixed(4),
+                netProfit: `${bestUnprofitable.netProfit.toFixed(4)} GALA`,
                 pair: bestUnprofitable.pair,
                 direction: bestUnprofitable.direction,
+                status: bestUnprofitable.netProfit > 0 ? 'Profitable but below minimum' : 'UNPROFITABLE (would lose money)',
               },
-              minRequiredProfit: this.MIN_PROFIT_GALA,
-              note: 'All opportunities are unprofitable (would result in losses). Bot is correctly protecting funds by not executing.',
+              minRequiredProfit: `${this.MIN_PROFIT_GALA} GALA`,
+              gwethStatus: shouldSkipGweth 
+                ? `Skipped (circuit breaker: ${this.gwethFailureCount} failures)` 
+                : 'Checked',
+              note: 'All opportunities are unprofitable. Bot is correctly protecting funds by NOT executing losing trades.',
             },
-            'Arbitrage check complete: No profitable opportunities found',
+            '⚠️ Arbitrage check complete: No profitable opportunities found',
           );
         } else {
           logger.info(
