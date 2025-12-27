@@ -83,6 +83,14 @@ export class ArbitrageStrategy implements ISwapStrategy {
     
     // Rate limit arbitrage checks
     if (now - this.lastArbitrageCheck < this.ARBITRAGE_CHECK_INTERVAL) {
+      const timeUntilNextCheck = this.ARBITRAGE_CHECK_INTERVAL - (now - this.lastArbitrageCheck);
+      logger.debug(
+        {
+          timeUntilNextCheck: Math.round(timeUntilNextCheck / 1000),
+          interval: this.ARBITRAGE_CHECK_INTERVAL / 1000,
+        },
+        'Arbitrage strategy: rate limited (waiting for next check interval)',
+      );
       return {
         swapsToTerminate: [],
         swapsToAccept: [],
@@ -94,13 +102,13 @@ export class ArbitrageStrategy implements ISwapStrategy {
 
     // Check if required dependencies are available
     if (!options.binanceApi || !options.binanceTrading || !options.galaChainRouter) {
-      logger.debug(
+      logger.warn(
         {
           hasBinanceApi: !!options.binanceApi,
           hasBinanceTrading: !!options.binanceTrading,
           hasGalaChainRouter: !!options.galaChainRouter,
         },
-        'Arbitrage strategy: missing required dependencies',
+        'Arbitrage strategy: missing required dependencies - skipping check',
       );
       return {
         swapsToTerminate: [],
@@ -109,7 +117,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
       };
     }
     
-    logger.debug('Arbitrage strategy: checking for opportunities');
+    logger.info('Arbitrage strategy: starting opportunity check');
 
     // Check if we have enough GALA balance
     const galaBalance = ownBalances.find((b) => b.collection === 'GALA');
@@ -119,13 +127,13 @@ export class ArbitrageStrategy implements ISwapStrategy {
     const tradeAmount = BigNumber.min(availableGala, BigNumber(this.GALA_AMOUNT)).toNumber();
     
     if (!galaBalance || availableGala.isLessThan(this.MIN_GALA_AMOUNT)) {
-      logger.debug(
+      logger.warn(
         {
           availableBalance: availableGala.toString(),
           minRequired: this.MIN_GALA_AMOUNT,
           configuredAmount: this.GALA_AMOUNT,
         },
-        'Arbitrage strategy: insufficient GALA balance (below minimum)',
+        'Arbitrage strategy: insufficient GALA balance (below minimum) - skipping check',
       );
       return {
         swapsToTerminate: [],
@@ -173,25 +181,34 @@ export class ArbitrageStrategy implements ISwapStrategy {
                               (now - this.gwethLastFailureTime) < this.GWETH_RETRY_INTERVAL;
       
       if (shouldSkipGweth) {
-        logger.debug(
+        logger.info(
           {
             failureCount: this.gwethFailureCount,
             lastFailureTime: new Date(this.gwethLastFailureTime).toISOString(),
             retryAfter: new Date(this.gwethLastFailureTime + this.GWETH_RETRY_INTERVAL).toISOString(),
             note: 'GWETH pool has insufficient liquidity. Skipping GWETH checks temporarily.',
           },
-          'Skipping GWETH arbitrage checks (circuit breaker active)',
+          'Arbitrage: Skipping GWETH checks (circuit breaker active)',
         );
       }
 
+      logger.info(
+        {
+          validSizes: validSizes,
+          totalSizes: validSizes.length,
+          availableBalance: availableGala.toString(),
+        },
+        'Arbitrage: Checking opportunities with multiple trade sizes',
+      );
+
       // Try each trade size to find the most profitable opportunity
       for (const tradeSize of validSizes) {
-        logger.debug(
+        logger.info(
           {
             tradeSize,
             availableBalance: availableGala.toString(),
           },
-          'Trying arbitrage with trade size',
+          'Arbitrage: Checking opportunity with trade size',
         );
 
         // Try GALA/GWETH first (primary pair) - but only if circuit breaker is not active
@@ -227,12 +244,13 @@ export class ArbitrageStrategy implements ISwapStrategy {
                 'GWETH circuit breaker activated - skipping GWETH checks',
               );
             } else {
-              logger.debug(
+              logger.info(
                 {
                   failureCount: this.gwethFailureCount,
                   maxFailures: this.GWETH_MAX_FAILURES,
+                  tradeSize,
                 },
-                'GWETH arbitrage check failed (liquidity issue)',
+                'Arbitrage: GWETH check failed (liquidity issue)',
               );
             }
           } else {
@@ -252,13 +270,20 @@ export class ArbitrageStrategy implements ISwapStrategy {
 
         // If GALA/GWETH still fails due to liquidity, try alternative pairs
         if (!arbitrageOpportunity) {
+          logger.info(
+            {
+              tradeSize,
+              note: 'GALA/GWETH pair unavailable, trying alternative pairs',
+            },
+            'Arbitrage: Trying alternative pairs',
+          );
           for (const pair of this.ALTERNATIVE_PAIRS) {
-            logger.debug(
+            logger.info(
               {
                 pair: pair.description,
                 tradeSize,
               },
-              'Trying alternative arbitrage pair due to GALA/GWETH liquidity issues',
+              'Arbitrage: Checking alternative pair',
             );
             
             arbitrageOpportunity = await this.checkArbitrageOpportunity(
@@ -276,10 +301,11 @@ export class ArbitrageStrategy implements ISwapStrategy {
               logger.info(
                 {
                   pair: pair.description,
-                  netProfit: arbitrageOpportunity.netProfit,
+                  netProfit: arbitrageOpportunity.netProfit.toFixed(4),
                   tradeSize,
+                  isProfitable: arbitrageOpportunity.netProfit > 0,
                 },
-                'Found arbitrage opportunity with alternative pair',
+                'Arbitrage: Found opportunity with alternative pair',
               );
               break; // Found a working pair, stop trying others
             }
@@ -349,11 +375,11 @@ export class ArbitrageStrategy implements ISwapStrategy {
         const availableUsdt = usdtBalance ? parseFloat(usdtBalance.free) : 0;
           
         if (availableUsdt >= 10) { // Need at least $10 USDT to try reverse arbitrage
-          logger.debug(
+          logger.info(
             {
               availableUsdt: availableUsdt.toFixed(2),
             },
-            'Checking reverse arbitrage direction (Binance->GalaSwap)',
+            'Arbitrage: Checking reverse direction (Binance->GalaSwap)',
           );
 
           // Try reverse direction for each trade size
@@ -425,12 +451,12 @@ export class ArbitrageStrategy implements ISwapStrategy {
             }
           }
         } else {
-          logger.debug(
+          logger.info(
             {
               availableUsdt: availableUsdt.toFixed(2),
               minRequired: 10,
             },
-            'Skipping reverse arbitrage: insufficient USDT balance on Binance',
+            'Arbitrage: Skipping reverse direction (insufficient USDT on Binance)',
           );
         }
       } catch (error) {
@@ -498,6 +524,21 @@ export class ArbitrageStrategy implements ISwapStrategy {
           arbitrageOpportunity!.tradeAmount,
           arbitrageOpportunity!.direction || 'GalaSwap->Binance',
         );
+      } else if (bestOpportunity) {
+        logger.info(
+          {
+            netProfit: bestOpportunity.netProfit.toFixed(4),
+            minRequired: this.MIN_PROFIT_GALA,
+            galaAmount: bestOpportunity.tradeAmount,
+            allowLossTrades: this.ALLOW_LOSS_TRADES,
+            note: bestOpportunity.netProfit <= 0 
+              ? (this.ALLOW_LOSS_TRADES 
+                  ? 'Trade would result in LOSS but ALLOW_LOSS_TRADES is enabled - should execute but opportunity not selected'
+                  : 'Trade would result in LOSS - not executing (ALLOW_LOSS_TRADES disabled)')
+              : 'Profit below minimum threshold',
+          },
+          'Arbitrage: Opportunity found but not executing',
+        );
       } else if (arbitrageOpportunity) {
         logger.info(
           {
@@ -511,7 +552,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
                   : 'Trade would result in LOSS - not executing (ALLOW_LOSS_TRADES disabled)')
               : 'Profit below minimum threshold',
           },
-          'Arbitrage opportunity found but not executing',
+          'Arbitrage: Opportunity found but not executing',
         );
       } else {
         // Log summary of all opportunities checked
@@ -520,7 +561,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
             opp.netProfit > best.netProfit ? opp : best
           );
           
-          logger.warn(
+          logger.info(
             {
               opportunitiesChecked: allOpportunities.length,
               bestOpportunity: {
@@ -536,19 +577,34 @@ export class ArbitrageStrategy implements ISwapStrategy {
                 : 'Checked',
               note: 'All opportunities are unprofitable. Bot is correctly protecting funds by NOT executing losing trades.',
             },
-            '⚠️ Arbitrage check complete: No profitable opportunities found',
+            'Arbitrage: Check complete - No profitable opportunities found',
           );
         } else {
           logger.info(
             {
               checkedSizes: validSizes,
               availableBalance: availableGala.toString(),
+              gwethStatus: shouldSkipGweth 
+                ? `Skipped (circuit breaker: ${this.gwethFailureCount} failures)` 
+                : 'Checked',
               note: 'No arbitrage opportunities found (likely due to liquidity issues or price parity)',
             },
-            'No arbitrage opportunities found across all trade sizes',
+            'Arbitrage: No opportunities found across all trade sizes',
           );
         }
       }
+      
+      // Always log a summary at the end of each check
+      logger.info(
+        {
+          totalOpportunitiesChecked: allOpportunities.length,
+          profitableOpportunities: allOpportunities.filter(o => o.netProfit > 0 && o.netProfit >= this.MIN_PROFIT_GALA).length,
+          unprofitableOpportunities: allOpportunities.filter(o => o.netProfit <= 0).length,
+          tradeSizesChecked: validSizes.length,
+          nextCheckIn: `${Math.round(this.ARBITRAGE_CHECK_INTERVAL / 1000)}s`,
+        },
+        'Arbitrage: Check cycle complete',
+      );
     } catch (error) {
       logger.error(
         {
