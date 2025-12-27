@@ -1,11 +1,12 @@
 # GalaSwap Trading Bot
 
-This is an example of a trading bot that uses the GalaSwap API to trade on the GalaSwap exchange.
+This is an advanced trading bot that uses the GalaSwap API and Binance API to trade on both GalaSwap and Binance exchanges.
 
-It comes with two built-in trading strategies:
+It comes with three built-in trading strategies:
 
-1. Basic Swap Accepter: Identifies and accepts swaps that are being offered at a rate better than the current going market rate (based on prices from GalaSwap, which typically come from CoinGecko).
-2. Basic Swap Creator: Offers liquidity by creating swaps at a specified rate. Cancels and recreates swaps when the market rates change sufficiently.
+1. **Arbitrage Strategy**: Identifies and executes profitable arbitrage opportunities between GalaSwap and Binance by exploiting price differences. Executes trades on both platforms simultaneously to complete the arbitrage cycle. Only executes when profit >= 1 GALA.
+2. **Basic Swap Accepter**: Identifies and accepts swaps that are being offered at a rate better than the current going market rate (based on prices from GalaSwap, which typically come from CoinGecko).
+3. **Basic Swap Creator**: Offers liquidity by creating swaps at a specified rate. Cancels and recreates swaps when the market rates change sufficiently.
 
 ## Getting the Code
 
@@ -27,6 +28,11 @@ First create a `.env` file in the root directory of this project. This is where 
 MONGO_PASSWORD=a password for the database instance (this can be any password you want, if you're using Docker, but it should only include letters and numbers)
 GALA_WALLET_ADDRESS=your GalaChain wallet address (see the "Getting your Private Key" section at https://galaswap.gala.com/info/api.html)
 GALA_PRIVATE_KEY=the GalaChain private key of your Gala account (see the "Getting your Private Key" section at https://galaswap.gala.com/info/api.html)
+
+# Binance API credentials (required for arbitrage strategy)
+BINANCE_ENABLED=true
+BINANCE_API_KEY=your_binance_api_key
+BINANCE_API_SECRET=your_binance_api_secret
 ```
 
 Make sure not to use any special characters in `MONGO_PASSWORD`.
@@ -72,6 +78,61 @@ Next, if you're going to use the included strategies, you should configure them 
    - `projectTokens`: By default, the bot will only fetch price information for "trending" tokens (including $GALA and most other tokens that have prices available on CoinGecko). To fetch prices for other tokens, include their symbols here. Don't include more than a handful of project tokens or you may get rate-limited.
 
 The default configuration has some sane defaults for trading GALA and GUSDC in both directions.
+
+## Arbitrage Strategy
+
+The arbitrage strategy identifies price differences between GalaSwap and Binance and executes trades on both platforms to profit from the difference.
+
+### How It Works
+
+1. **Forward Arbitrage (GalaSwap → Binance)**:
+   - Sells GALA on GalaSwap for GUSDC/GWETH
+   - Buys GALA on Binance using the received USDT/ETH
+   - Profits from the price difference
+
+2. **Reverse Arbitrage (Binance → GalaSwap)**:
+   - Buys GALA on Binance using USDT
+   - Sells GALA on GalaSwap for GUSDC
+   - Profits from the price difference
+
+### Features
+
+- **Automatic Profit Calculation**: Accounts for all fees (GalaSwap fees, Binance fees, gas fees)
+- **Dynamic Trade Sizing**: Tries multiple trade sizes (1000, 2000, 3000, 4000, 5000 GALA) to find the best opportunity
+- **Liquidity Handling**: Automatically falls back to alternative pairs (GUSDC/GUSDT) if GWETH pool has insufficient liquidity
+- **Circuit Breaker**: Temporarily skips illiquid pairs after consecutive failures
+- **Profit-Only Execution**: Only executes trades when profit >= 1 GALA (configurable)
+- **Bidirectional**: Checks both forward and reverse arbitrage opportunities
+
+### Configuration
+
+The arbitrage strategy is configured in `src/strategies/arbitrage/arbitrage_strategy.ts`:
+
+- `GALA_AMOUNT`: Maximum amount of GALA to trade (default: 5000)
+- `MIN_PROFIT_GALA`: Minimum profit in GALA to execute (default: 1 GALA)
+- `ALLOW_LOSS_TRADES`: Set to `false` to only execute profitable trades (default: `false`)
+- `TRADE_SIZE_OPTIONS`: Trade sizes to try (default: [1000, 2000, 3000, 4000, 5000])
+
+### Binance Setup
+
+1. Create a Binance account and enable API access
+2. Create an API key with **Spot Trading** permissions
+3. Add your API key and secret to `.env`:
+   ```
+   BINANCE_ENABLED=true
+   BINANCE_API_KEY=your_api_key_here
+   BINANCE_API_SECRET=your_secret_key_here
+   ```
+
+### Important Notes
+
+- **Separate Wallets**: GalaSwap and Binance use separate wallets/accounts
+- **Both Trades Execute**: The bot executes trades on both platforms to complete the arbitrage cycle
+- **Fee Calculation**: The bot accounts for:
+  - GalaSwap fees (0.05%, 0.30%, or 1.00% depending on fee tier)
+  - Binance market fees (0.1%) or maker fees (0.02% with limit orders)
+  - Estimated gas fees (0.5 GALA)
+- **Minimum Trade Amount**: Binance has a minimum trade amount (default: 10 USDT), but arbitrage trades bypass this check
 
 ## Running the Bot
 
