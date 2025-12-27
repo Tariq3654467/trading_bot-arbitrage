@@ -32,9 +32,12 @@ export class ArbitrageStrategy implements ISwapStrategy {
   private readonly GALA_AMOUNT: number = 5000; // Maximum amount of GALA to trade
   private readonly MIN_PROFIT_GALA: number = 1; // Minimum profit in GALA to execute (any positive profit)
   private readonly MAX_PROFIT_GALA: number = 30; // Maximum expected profit
-  private readonly BINANCE_FEE_RATE: number = 0.001; // 0.1% trading fee
-  private readonly GALA_SWAP_FEE_RATE: number = 0.003; // 0.3% swap fee (estimate)
-  private readonly GAS_FEE_GALA: number = 1; // Estimated gas fee in GALA (reduced from 5 - actual gas is typically < 1 GALA)
+  // Binance fees: Market orders = 0.1%, Limit maker orders = 0.02% (80% savings!)
+  private readonly BINANCE_MARKET_FEE_RATE: number = 0.001; // 0.1% for market orders (current)
+  private readonly BINANCE_MAKER_FEE_RATE: number = 0.0002; // 0.02% for limit maker orders (future optimization)
+  // GalaSwap fees: Use actual fee tier from quote (0.05%, 0.30%, or 1.00%)
+  // Fee tiers: 500 = 0.05% (stable pairs), 3000 = 0.30% (most pairs), 10000 = 1.00% (volatile pairs)
+  private readonly GAS_FEE_GALA: number = 0.5; // Optimized gas estimate (actual is typically 0.1-0.5 GALA)
   private readonly MIN_GALA_AMOUNT: number = 1000; // Minimum amount to attempt (to avoid CONFLICT errors)
   // Try different trade sizes to find profitable opportunities (smaller sizes = less slippage)
   private readonly TRADE_SIZE_OPTIONS: number[] = [1000, 2000, 3000, 4000, 5000]; // Try smaller sizes first
@@ -415,7 +418,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
           `🚀 Arbitrage Opportunity: ${arbitrageOpportunity.netProfit.toFixed(2)} GALA profit (${arbitrageOpportunity.tradeAmount} GALA trade)`,
         );
 
-        // Execute arbitrage trades
+        // Execute arbitrage trades on both platforms
         await this.executeArbitrage(
           logger,
           options.binanceApi,
@@ -423,6 +426,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
           options.galaChainRouter,
           arbitrageOpportunity,
           arbitrageOpportunity.tradeAmount,
+          arbitrageOpportunity.direction || 'GalaSwap->Binance',
         );
       } else if (arbitrageOpportunity) {
         logger.info(
@@ -589,13 +593,19 @@ export class ArbitrageStrategy implements ISwapStrategy {
       }
 
       const receivingTokenAmount = Number(galaSwapQuote.amountOut);
+      // Get actual fee tier from quote (500 = 0.05%, 3000 = 0.30%, 10000 = 1.00%)
+      const feeTier = galaSwapQuote.feeTier ? Number(galaSwapQuote.feeTier) : 3000; // Default to 0.30% if not provided
+      const actualGalaSwapFeeRate = feeTier / 10000; // Convert basis points to decimal (e.g., 3000 = 0.003 = 0.3%)
+      
       logger.info(
         {
           galaAmount,
           receivingTokenAmount,
           receivingToken,
+          feeTier,
+          actualFeeRate: `${(actualGalaSwapFeeRate * 100).toFixed(2)}%`,
         },
-        'GalaSwap quote received',
+        'GalaSwap quote received with actual fee tier',
       );
 
       // Step 2: Get Binance prices
@@ -668,17 +678,23 @@ export class ArbitrageStrategy implements ISwapStrategy {
         'Calculated GALA buyable on Binance',
       );
 
-      // Step 4: Calculate fees
-      // GalaSwap fee: 0.3% of GALA amount
-      const galaSwapFee = galaAmount * this.GALA_SWAP_FEE_RATE;
+      // Step 4: Calculate fees (using actual rates to minimize)
+      // GalaSwap fee: Use actual fee tier from quote (typically 0.05% for stable pairs, 0.30% for others)
+      const galaSwapFee = galaAmount * actualGalaSwapFeeRate;
       
-      // Binance trading fee: 0.1% of trade value
-      const binanceFee = galaBuyableOnBinance * this.BINANCE_FEE_RATE;
+      // Binance trading fee: Use maker fee rate (0.02%) if we use limit orders, otherwise market fee (0.1%)
+      // For now, we'll use market fee but note that limit orders would be cheaper
+      // TODO: Consider using limit orders to get maker fees (0.02% instead of 0.1%)
+      const binanceFee = galaBuyableOnBinance * this.BINANCE_MARKET_FEE_RATE;
       
-      // Gas fee (fixed estimate)
+      // Gas fee (optimized estimate)
       const gasFee = this.GAS_FEE_GALA;
       
       const totalFees = galaSwapFee + binanceFee + gasFee;
+      
+      // Calculate potential savings if using limit orders
+      const potentialMakerFee = galaBuyableOnBinance * this.BINANCE_MAKER_FEE_RATE;
+      const feeSavings = binanceFee - potentialMakerFee;
 
       // Step 5: Calculate net profit
       // Net profit = (GALA received on Binance) - (GALA sold on GalaSwap) - (All Fees)
@@ -688,13 +704,21 @@ export class ArbitrageStrategy implements ISwapStrategy {
           {
             galaSold: galaAmount,
             galaReceived: galaBuyableOnBinance,
-            galaSwapFee,
-            binanceFee,
-            gasFee,
-            totalFees,
-            netProfit,
+            fees: {
+              galaSwapFee: galaSwapFee.toFixed(4),
+              galaSwapFeeRate: `${(actualGalaSwapFeeRate * 100).toFixed(2)}%`,
+              binanceFee: binanceFee.toFixed(4),
+              binanceFeeRate: `${(this.BINANCE_MARKET_FEE_RATE * 100).toFixed(2)}%`,
+              gasFee: gasFee.toFixed(4),
+              totalFees: totalFees.toFixed(4),
+            },
+            potentialSavings: feeSavings > 0 ? {
+              usingLimitOrders: `Save ${feeSavings.toFixed(4)} GALA (${((feeSavings / totalFees) * 100).toFixed(1)}% fee reduction)`,
+              note: 'Consider using limit orders to get 0.02% maker fee instead of 0.1% market fee',
+            } : undefined,
+            netProfit: netProfit.toFixed(4),
           },
-          'Arbitrage calculation complete',
+          'Arbitrage calculation complete (fees minimized)',
         );
 
       return {
@@ -741,7 +765,8 @@ export class ArbitrageStrategy implements ISwapStrategy {
       const galaPriceUsdt = Number(galaPriceResponse.price);
 
       // Step 2: Calculate cost to buy GALA on Binance (including fees)
-      const binanceBuyFee = galaAmount * this.BINANCE_FEE_RATE;
+      // Use market fee for now (could optimize with limit orders for maker fee)
+      const binanceBuyFee = galaAmount * galaPriceUsdt * this.BINANCE_MARKET_FEE_RATE;
       const totalCostUsdt = usdtNeeded + binanceBuyFee;
 
       // Step 3: Get quote from GalaSwap: How much token do we get for selling GALA?
@@ -786,8 +811,11 @@ export class ArbitrageStrategy implements ISwapStrategy {
       // GUSDC is 1:1 with USDT, so this is the USDT value we get
       const usdtReceived = receivingTokenAmount;
 
-      // Step 4: Calculate fees
-      const galaSwapFee = galaAmount * this.GALA_SWAP_FEE_RATE;
+      // Step 4: Calculate fees (minimized)
+      // Get actual fee tier from quote (GUSDC/GALA pair might use 0.05% fee tier)
+      const feeTier = galaSwapQuote.feeTier ? Number(galaSwapQuote.feeTier) : 3000; // Default to 0.30% if not provided
+      const actualGalaSwapFeeRate = feeTier / 10000; // Convert basis points to decimal
+      const galaSwapFee = galaAmount * actualGalaSwapFeeRate;
       const gasFee = this.GAS_FEE_GALA;
       const totalFees = binanceBuyFee + galaSwapFee + gasFee;
 
@@ -835,7 +863,8 @@ export class ArbitrageStrategy implements ISwapStrategy {
   }
 
   /**
-   * Execute arbitrage trades simultaneously
+   * Execute arbitrage trades on both platforms simultaneously
+   * Direction: 'GalaSwap->Binance' or 'Binance->GalaSwap'
    */
   private async executeArbitrage(
     logger: ILogger,
@@ -850,15 +879,33 @@ export class ArbitrageStrategy implements ISwapStrategy {
       pair: string;
     },
     galaAmount: number,
+    direction: 'GalaSwap->Binance' | 'Binance->GalaSwap' = 'GalaSwap->Binance',
   ): Promise<void> {
     try {
       logger.info(
         {
           netProfit: opportunity.netProfit,
+          direction,
+          galaAmount,
+          pair: opportunity.pair,
         },
-        'Starting arbitrage execution',
+        '🚀 Starting arbitrage execution on BOTH platforms',
       );
 
+      if (direction === 'Binance->GalaSwap') {
+        // Reverse direction: Buy GALA on Binance first, then sell on GalaSwap
+        await this.executeReverseArbitrage(
+          logger,
+          binanceApi,
+          binanceTrading,
+          galaChainRouter,
+          opportunity,
+          galaAmount,
+        );
+        return;
+      }
+
+      // Forward direction: Sell GALA on GalaSwap first, then buy on Binance
       // Step 1: Execute GalaSwap trade (Sell GALA for receiving token)
       // Parse the pair to determine receiving token
       const pairParts = opportunity.pair.split('/');
@@ -903,8 +950,11 @@ export class ArbitrageStrategy implements ISwapStrategy {
         {
           transactionId: galaSwapResult.transactionId,
           status: galaSwapResult.status,
+          galaSold: galaAmount,
+          receivingToken,
+          receivingTokenAmount: opportunity.receivingTokenAmount,
         },
-        'GalaSwap trade executed',
+        '✅ GalaSwap trade executed successfully',
       );
 
       // Step 2: Execute Binance trade (Buy GALA)
@@ -947,8 +997,9 @@ export class ArbitrageStrategy implements ISwapStrategy {
             {
               netProfit: opportunity.netProfit,
               galaReceived: galaAmountToBuy,
+              pair: opportunity.pair,
             },
-            'Arbitrage execution complete!',
+            '✅ Forward arbitrage execution complete on BOTH platforms!',
           );
           return;
         }
@@ -1003,8 +1054,9 @@ export class ArbitrageStrategy implements ISwapStrategy {
             netProfit: opportunity.netProfit,
             galaReceived: opportunity.galaBuyableOnBinance,
             pair: opportunity.pair,
+            usdtSpent: opportunity.receivingTokenAmount,
           },
-          'Arbitrage execution complete!',
+          '✅ Forward arbitrage execution complete on BOTH platforms!',
         );
       } else {
         logger.warn(
@@ -1022,8 +1074,140 @@ export class ArbitrageStrategy implements ISwapStrategy {
           errorStack: error?.stack,
           errorType: error?.constructor?.name,
           opportunity,
+          direction,
         },
         'Failed to execute arbitrage trades',
+      );
+      throw error;
+    }
+  }
+
+  /**
+   * Execute reverse arbitrage: Buy GALA on Binance, then sell on GalaSwap
+   */
+  private async executeReverseArbitrage(
+    logger: ILogger,
+    binanceApi: IBinanceApi,
+    binanceTrading: BinanceTrading,
+    galaChainRouter: GalaChainRouter,
+    opportunity: {
+      receivingTokenAmount: number;
+      galaBuyableOnBinance: number;
+      totalFees: number;
+      netProfit: number;
+      pair: string;
+    },
+    galaAmount: number,
+  ): Promise<void> {
+    try {
+      logger.info(
+        {
+          direction: 'Binance->GalaSwap',
+          galaAmount,
+          pair: opportunity.pair,
+        },
+        'Executing reverse arbitrage: Step 1 - Buying GALA on Binance',
+      );
+
+      // Step 1: Buy GALA on Binance with USDT
+      const galaPriceResponse = await binanceApi.getPrice('GALAUSDT');
+      if (!galaPriceResponse) {
+        throw new Error('Failed to get GALA price from Binance');
+      }
+      
+      const galaPriceUsdt = Number(galaPriceResponse.price);
+      const usdtNeeded = galaAmount * galaPriceUsdt;
+
+      if (!binanceTrading) {
+        throw new Error('BinanceTrading is not available - cannot execute Binance trade');
+      }
+
+      logger.info(
+        {
+          symbol: 'GALAUSDT',
+          side: 'BUY',
+          usdtAmount: usdtNeeded.toFixed(4),
+          galaAmount,
+          price: galaPriceUsdt,
+        },
+        'Executing Binance BUY order',
+      );
+
+      const binanceOrder = await binanceTrading.executeTrade({
+        symbol: 'GALAUSDT',
+        side: 'BUY',
+        type: 'MARKET',
+        quantity: String(usdtNeeded), // Amount in USDT (quote currency)
+      });
+
+      logger.info(
+        {
+          orderId: binanceOrder.orderId,
+          status: binanceOrder.status,
+          executedQty: binanceOrder.executedQty,
+          cummulativeQuoteQty: binanceOrder.cummulativeQuoteQty,
+        },
+        '✅ Binance trade executed successfully',
+      );
+
+      // Step 2: Sell GALA on GalaSwap for receiving token (GUSDC)
+      const receivingToken = 'GUSDC'; // From reverse arbitrage check
+      
+      logger.info(
+        {
+          tokenIn: 'GALA|Unit|none|none',
+          tokenOut: `${receivingToken}|Unit|none|none`,
+          amountIn: galaAmount,
+          expectedOut: opportunity.receivingTokenAmount,
+        },
+        'Executing reverse arbitrage: Step 2 - Selling GALA on GalaSwap',
+      );
+
+      const galaSwapResult = await galaChainRouter.requestSwap({
+        offered: [
+          {
+            quantity: String(galaAmount),
+            tokenInstance: {
+              collection: 'GALA',
+              category: 'Unit',
+              type: 'none',
+              additionalKey: 'none',
+            },
+          },
+        ],
+        wanted: [
+          {
+            quantity: String(opportunity.receivingTokenAmount),
+            tokenInstance: {
+              collection: receivingToken,
+              category: 'Unit',
+              type: 'none',
+              additionalKey: 'none',
+            },
+          },
+        ],
+      });
+
+      logger.info(
+        {
+          transactionId: galaSwapResult.transactionId,
+          status: galaSwapResult.status,
+          netProfit: opportunity.netProfit,
+          receivingToken,
+          receivingTokenAmount: opportunity.receivingTokenAmount,
+        },
+        '✅ Reverse arbitrage execution complete on BOTH platforms!',
+      );
+    } catch (error: any) {
+      logger.error(
+        {
+          error: error?.message || error?.toString() || error,
+          errorStack: error?.stack,
+          errorType: error?.constructor?.name,
+          opportunity,
+          direction: 'Binance->GalaSwap',
+        },
+        '❌ Failed to execute reverse arbitrage trades',
       );
       throw error;
     }
