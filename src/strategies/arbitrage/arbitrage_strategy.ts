@@ -257,23 +257,116 @@ export class ArbitrageStrategy implements ISwapStrategy {
           }
         }
 
+        // Track all opportunities (even unprofitable ones) for summary
+        if (arbitrageOpportunity) {
+          allOpportunities.push({
+            tradeSize,
+            netProfit: arbitrageOpportunity.netProfit,
+            pair: arbitrageOpportunity.pair,
+            direction: 'GalaSwap->Binance',
+          });
+        }
+
         // If we found a profitable opportunity, compare it with the best one so far
         if (arbitrageOpportunity && arbitrageOpportunity.netProfit > 0) {
           if (!bestOpportunity || arbitrageOpportunity.netProfit > bestOpportunity.netProfit) {
             bestOpportunity = {
               ...arbitrageOpportunity,
               tradeAmount: tradeSize,
+              direction: 'GalaSwap->Binance',
             };
             logger.info(
               {
                 tradeSize,
                 netProfit: arbitrageOpportunity.netProfit,
                 pair: arbitrageOpportunity.pair,
+                direction: 'GalaSwap->Binance',
               },
               'Found profitable arbitrage opportunity',
             );
           }
         }
+      }
+
+      // Check reverse direction: Binance -> GalaSwap (if GALA is cheaper on Binance)
+      // This requires USDT balance on Binance, so we'll check that first
+      try {
+        const binanceBalances = await options.binanceApi.getBalances();
+        const usdtBalance = binanceBalances.get('USDT');
+        const availableUsdt = usdtBalance ? parseFloat(usdtBalance.free) : 0;
+          
+        if (availableUsdt >= 10) { // Need at least $10 USDT to try reverse arbitrage
+          logger.debug(
+            {
+              availableUsdt: availableUsdt.toFixed(2),
+            },
+            'Checking reverse arbitrage direction (Binance->GalaSwap)',
+          );
+
+          // Try reverse direction for each trade size
+          for (const tradeSize of validSizes) {
+            // Calculate how much USDT we need for this trade size
+            const galaPriceResponse = await options.binanceApi.getPrice('GALAUSDT');
+            if (!galaPriceResponse) continue;
+            
+            const galaPriceUsdt = Number(galaPriceResponse.price);
+            const usdtNeeded = tradeSize * galaPriceUsdt;
+            
+            if (usdtNeeded > availableUsdt) continue; // Skip if not enough USDT
+
+            // Check reverse arbitrage: Buy GALA on Binance, sell on GalaSwap
+            const reverseOpportunity = await this.checkReverseArbitrageOpportunity(
+              logger,
+              options.binanceApi,
+              options.galaChainRouter,
+              tradeSize,
+              usdtNeeded,
+            );
+
+            if (reverseOpportunity) {
+              allOpportunities.push({
+                tradeSize,
+                netProfit: reverseOpportunity.netProfit,
+                pair: reverseOpportunity.pair,
+                direction: 'Binance->GalaSwap',
+              });
+
+              if (reverseOpportunity.netProfit > 0) {
+                if (!bestOpportunity || reverseOpportunity.netProfit > bestOpportunity.netProfit) {
+                  bestOpportunity = {
+                    ...reverseOpportunity,
+                    tradeAmount: tradeSize,
+                    direction: 'Binance->GalaSwap',
+                  };
+                  logger.info(
+                    {
+                      tradeSize,
+                      netProfit: reverseOpportunity.netProfit,
+                      pair: reverseOpportunity.pair,
+                      direction: 'Binance->GalaSwap',
+                    },
+                    'Found profitable reverse arbitrage opportunity',
+                  );
+                }
+              }
+            }
+          }
+        } else {
+          logger.debug(
+            {
+              availableUsdt: availableUsdt.toFixed(2),
+              minRequired: 10,
+            },
+            'Skipping reverse arbitrage: insufficient USDT balance on Binance',
+          );
+        }
+      } catch (error) {
+        logger.warn(
+          {
+            error: error instanceof Error ? error.message : String(error),
+          },
+          'Failed to check reverse arbitrage direction (Binance->GalaSwap)',
+        );
       }
 
       const arbitrageOpportunity = bestOpportunity;
@@ -319,13 +412,36 @@ export class ArbitrageStrategy implements ISwapStrategy {
           'Arbitrage opportunity found but not profitable enough',
         );
       } else {
-        logger.debug(
-          {
-            checkedSizes: validSizes,
-            availableBalance: availableGala.toString(),
-          },
-          'No profitable arbitrage opportunities found across all trade sizes',
-        );
+        // Log summary of all opportunities checked
+        if (allOpportunities.length > 0) {
+          const bestUnprofitable = allOpportunities.reduce((best, opp) => 
+            opp.netProfit > best.netProfit ? opp : best
+          );
+          
+          logger.info(
+            {
+              opportunitiesChecked: allOpportunities.length,
+              bestOpportunity: {
+                tradeSize: bestUnprofitable.tradeSize,
+                netProfit: bestUnprofitable.netProfit.toFixed(4),
+                pair: bestUnprofitable.pair,
+                direction: bestUnprofitable.direction,
+              },
+              minRequiredProfit: this.MIN_PROFIT_GALA,
+              note: 'All opportunities are unprofitable (would result in losses). Bot is correctly protecting funds by not executing.',
+            },
+            'Arbitrage check complete: No profitable opportunities found',
+          );
+        } else {
+          logger.info(
+            {
+              checkedSizes: validSizes,
+              availableBalance: availableGala.toString(),
+              note: 'No arbitrage opportunities found (likely due to liquidity issues or price parity)',
+            },
+            'No arbitrage opportunities found across all trade sizes',
+          );
+        }
       }
     } catch (error) {
       logger.error(
@@ -565,6 +681,125 @@ export class ArbitrageStrategy implements ISwapStrategy {
           error,
         },
         'Error checking arbitrage opportunity',
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Check reverse arbitrage opportunity: Buy GALA on Binance, sell on GalaSwap
+   * This is profitable when GALA is cheaper on Binance than on GalaSwap
+   */
+  private async checkReverseArbitrageOpportunity(
+    logger: ILogger,
+    binanceApi: IBinanceApi,
+    galaChainRouter: GalaChainRouter,
+    galaAmount: number,
+    usdtNeeded: number,
+  ): Promise<{
+    receivingTokenAmount: number;
+    galaBuyableOnBinance: number;
+    totalFees: number;
+    netProfit: number;
+    pair: string;
+  } | null> {
+    try {
+      // Step 1: Get GALA price on Binance
+      const galaPriceResponse = await binanceApi.getPrice('GALAUSDT');
+      if (!galaPriceResponse) {
+        return null;
+      }
+      const galaPriceUsdt = Number(galaPriceResponse.price);
+
+      // Step 2: Calculate cost to buy GALA on Binance (including fees)
+      const binanceBuyFee = galaAmount * this.BINANCE_FEE_RATE;
+      const totalCostUsdt = usdtNeeded + binanceBuyFee;
+
+      // Step 3: Get quote from GalaSwap: How much token do we get for selling GALA?
+      // Try GALA -> GUSDC first (most liquid)
+      const galaTokenKey = {
+        collection: 'GALA',
+        category: 'Unit',
+        type: 'none',
+        additionalKey: 'none',
+      };
+      
+      const receivingTokenKey = {
+        collection: 'GUSDC',
+        category: 'Unit',
+        type: 'none',
+        additionalKey: 'none',
+      };
+
+      let galaSwapQuote;
+      try {
+        galaSwapQuote = await galaChainRouter.getQuote(
+          galaTokenKey,
+          receivingTokenKey,
+          String(galaAmount),
+        );
+      } catch (error: any) {
+        logger.debug(
+          {
+            galaAmount,
+            error: error?.message || error?.key,
+          },
+          'Failed to get GalaSwap quote for reverse arbitrage',
+        );
+        return null;
+      }
+
+      if (!galaSwapQuote) {
+        return null;
+      }
+
+      const receivingTokenAmount = Number(galaSwapQuote.amountOut);
+      // GUSDC is 1:1 with USDT, so this is the USDT value we get
+      const usdtReceived = receivingTokenAmount;
+
+      // Step 4: Calculate fees
+      const galaSwapFee = galaAmount * this.GALA_SWAP_FEE_RATE;
+      const gasFee = this.GAS_FEE_GALA;
+      const totalFees = binanceBuyFee + galaSwapFee + gasFee;
+
+      // Step 5: Calculate net profit
+      // Net profit = (USDT received from GalaSwap) - (USDT spent on Binance) - (All Fees)
+      const netProfit = usdtReceived - totalCostUsdt - totalFees;
+      
+      // Convert profit to GALA for consistency
+      const netProfitGala = netProfit / galaPriceUsdt;
+
+      logger.info(
+        {
+          direction: 'Binance->GalaSwap',
+          galaBought: galaAmount,
+          usdtSpent: totalCostUsdt.toFixed(4),
+          usdtReceived: usdtReceived.toFixed(4),
+          receivingToken: 'GUSDC',
+          receivingTokenAmount: receivingTokenAmount.toFixed(4),
+          binanceFee: binanceBuyFee.toFixed(4),
+          galaSwapFee: galaSwapFee.toFixed(4),
+          gasFee,
+          totalFees: totalFees.toFixed(4),
+          netProfitUsdt: netProfit.toFixed(4),
+          netProfitGala: netProfitGala.toFixed(4),
+        },
+        'Reverse arbitrage calculation complete',
+      );
+
+      return {
+        receivingTokenAmount,
+        galaBuyableOnBinance: galaAmount, // We bought this amount
+        totalFees,
+        netProfit: netProfitGala, // Return profit in GALA for consistency
+        pair: 'GALA/GUSDC',
+      };
+    } catch (error) {
+      logger.error(
+        {
+          error: error instanceof Error ? error.message : String(error),
+        },
+        'Error checking reverse arbitrage opportunity',
       );
       return null;
     }
