@@ -2,6 +2,7 @@ import BigNumber from 'bignumber.js';
 import { MongoAcceptedSwapStore } from '../../dependencies/accepted_swap_store.js';
 import { IBinanceApi } from '../../dependencies/binance/binance_api.js';
 import { BinanceTrading } from '../../dependencies/binance/binance_trading.js';
+import { IBinanceTokenMappingConfig, getBinanceSymbol } from '../../dependencies/binance/token_mapping.js';
 import { MongoCreatedSwapStore } from '../../dependencies/created_swap_store.js';
 import {
   IGalaSwapApi,
@@ -12,7 +13,8 @@ import {
 import { GalaChainRouter } from '../../dependencies/onchain/galachain_router.js';
 import { MongoPriceStore } from '../../dependencies/price_store.js';
 import { IStatusReporter } from '../../dependencies/status_reporters.js';
-import { ILogger } from '../../types/types.js';
+import { ITokenConfig } from '../../token_config.js';
+import { ILogger, ITokenClassKey } from '../../types/types.js';
 import { ISwapStrategy, ISwapToAccept, ISwapToCreate, ISwapToTerminate } from '../swap_strategy.js';
 
 /**
@@ -73,6 +75,8 @@ export class ArbitrageStrategy implements ISwapStrategy {
       binanceTrading?: BinanceTrading | null;
       galaDeFiApi?: any;
       galaChainRouter?: GalaChainRouter | null;
+      tokenConfig?: ITokenConfig;
+      binanceMappingConfig?: IBinanceTokenMappingConfig;
     },
   ): Promise<{
     swapsToTerminate: readonly Readonly<ISwapToTerminate>[];
@@ -119,21 +123,92 @@ export class ArbitrageStrategy implements ISwapStrategy {
     
     logger.info('Arbitrage strategy: starting opportunity check');
 
-    // Check if we have enough GALA balance
-    const galaBalance = ownBalances.find((b) => b.collection === 'GALA');
-    const availableGala = galaBalance ? BigNumber(galaBalance.quantity) : BigNumber(0);
-    
-    // Use available balance, but ensure it meets minimum requirements
-    const tradeAmount = BigNumber.min(availableGala, BigNumber(this.GALA_AMOUNT)).toNumber();
-    
-    if (!galaBalance || availableGala.isLessThan(this.MIN_GALA_AMOUNT)) {
-      logger.warn(
+    // Get Binance mapping config
+    const binanceMappingConfig = options.binanceMappingConfig;
+    if (!binanceMappingConfig || !binanceMappingConfig.enabled) {
+      logger.warn('Arbitrage strategy: Binance mapping config not available or disabled - skipping check');
+      return {
+        swapsToTerminate: [],
+        swapsToAccept: [],
+        swapsToCreate: [],
+      };
+    }
+
+    // Find all token balances that have Binance mappings
+    const arbitrageableTokens: Array<{
+      balance: ITokenBalance;
+      binanceSymbol: string;
+      quoteCurrency: string;
+      tokenKey: ITokenClassKey;
+    }> = [];
+
+    for (const balance of ownBalances) {
+      const tokenKey: ITokenClassKey = {
+        collection: balance.collection,
+        category: balance.category,
+        type: balance.type,
+        additionalKey: balance.additionalKey,
+      };
+
+      // Check if this token has a Binance mapping
+      const binanceSymbol = getBinanceSymbol(tokenKey, binanceMappingConfig);
+      
+      if (binanceSymbol) {
+        // Find the mapping to get quote currency
+        const mapping = binanceMappingConfig.mappings.find(
+          (m) =>
+            m.galaToken.collection === tokenKey.collection &&
+            m.galaToken.category === tokenKey.category &&
+            m.galaToken.type === tokenKey.type &&
+            m.galaToken.additionalKey === tokenKey.additionalKey,
+        );
+        
+        const quoteCurrency = mapping?.quoteCurrency || binanceMappingConfig.defaultQuoteCurrency || 'USDT';
+        const balanceAmount = BigNumber(balance.quantity);
+        
+        // Only include if balance meets minimum (convert to equivalent GALA value for comparison)
+        // For now, use a simple check: if balance is significant enough
+        if (balanceAmount.isGreaterThan(0)) {
+          arbitrageableTokens.push({
+            balance,
+            binanceSymbol,
+            quoteCurrency,
+            tokenKey,
+          });
+        }
+      }
+    }
+
+    // Also check stablecoins (GUSDC/GUSDT) - they map to USDT
+    for (const balance of ownBalances) {
+      if (balance.collection === 'GUSDC' || balance.collection === 'GUSDT') {
+        const tokenKey: ITokenClassKey = {
+          collection: balance.collection,
+          category: balance.category,
+          type: balance.type,
+          additionalKey: balance.additionalKey,
+        };
+        
+        // Stablecoins are 1:1 with USDT, so we can arbitrage them
+        const balanceAmount = BigNumber(balance.quantity);
+        if (balanceAmount.isGreaterThan(10)) { // Need at least $10 worth
+          arbitrageableTokens.push({
+            balance,
+            binanceSymbol: 'USDT', // Will use USDT directly
+            quoteCurrency: 'USDT',
+            tokenKey,
+          });
+        }
+      }
+    }
+
+    if (arbitrageableTokens.length === 0) {
+      logger.info(
         {
-          availableBalance: availableGala.toString(),
-          minRequired: this.MIN_GALA_AMOUNT,
-          configuredAmount: this.GALA_AMOUNT,
+          totalBalances: ownBalances.length,
+          note: 'No token balances found with Binance mappings for arbitrage',
         },
-        'Arbitrage strategy: insufficient GALA balance (below minimum) - skipping check',
+        'Arbitrage strategy: no arbitrageable tokens found - skipping check',
       );
       return {
         swapsToTerminate: [],
@@ -141,22 +216,20 @@ export class ArbitrageStrategy implements ISwapStrategy {
         swapsToCreate: [],
       };
     }
-    
+
     logger.info(
       {
-        availableBalance: availableGala.toString(),
-        configuredAmount: this.GALA_AMOUNT,
+        arbitrageableTokens: arbitrageableTokens.map(t => ({
+          token: t.balance.collection,
+          balance: t.balance.quantity,
+          binanceSymbol: t.binanceSymbol,
+        })),
+        totalTokens: arbitrageableTokens.length,
       },
-      'Arbitrage strategy: checking opportunity with available balance',
+      'Arbitrage strategy: found tokens with Binance mappings - checking opportunities',
     );
 
     try {
-      // Try different trade sizes (smaller first to reduce slippage)
-      // Sort sizes in ascending order and filter to available balance
-      const validSizes = this.TRADE_SIZE_OPTIONS
-        .filter(size => size <= availableGala.toNumber() && size >= this.MIN_GALA_AMOUNT)
-        .sort((a, b) => a - b);
-      
       let bestOpportunity: {
         receivingTokenAmount: number;
         galaBuyableOnBinance: number;
@@ -165,6 +238,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
         pair: string;
         tradeAmount: number;
         direction?: 'GalaSwap->Binance' | 'Binance->GalaSwap';
+        token: string;
       } | null = null;
 
       // Track all opportunities for summary logging
@@ -173,300 +247,385 @@ export class ArbitrageStrategy implements ISwapStrategy {
         netProfit: number;
         pair: string;
         direction: string;
+        token: string;
       }> = [];
 
-      // Check if we should skip GWETH due to recent failures (circuit breaker)
-      const now = Date.now();
-      const shouldSkipGweth = this.gwethFailureCount >= this.GWETH_MAX_FAILURES && 
-                              (now - this.gwethLastFailureTime) < this.GWETH_RETRY_INTERVAL;
-      
-      if (shouldSkipGweth) {
-        logger.info(
-          {
-            failureCount: this.gwethFailureCount,
-            lastFailureTime: new Date(this.gwethLastFailureTime).toISOString(),
-            retryAfter: new Date(this.gwethLastFailureTime + this.GWETH_RETRY_INTERVAL).toISOString(),
-            note: 'GWETH pool has insufficient liquidity. Skipping GWETH checks temporarily.',
-          },
-          'Arbitrage: Skipping GWETH checks (circuit breaker active)',
-        );
-      }
-
-      logger.info(
-        {
-          validSizes: validSizes,
-          totalSizes: validSizes.length,
-          availableBalance: availableGala.toString(),
-        },
-        'Arbitrage: Checking opportunities with multiple trade sizes',
-      );
-
-      // Try each trade size to find the most profitable opportunity
-      for (const tradeSize of validSizes) {
-        logger.info(
-          {
-            tradeSize,
-            availableBalance: availableGala.toString(),
-          },
-          'Arbitrage: Checking opportunity with trade size',
-        );
-
-        // Try GALA/GWETH first (primary pair) - but only if circuit breaker is not active
-        let arbitrageOpportunity: ReturnType<typeof this.checkArbitrageOpportunity> extends Promise<infer T> ? T : null = null;
+      // Check arbitrage opportunities for each token that has a Binance mapping
+      for (const tokenInfo of arbitrageableTokens) {
+        const tokenBalance = BigNumber(tokenInfo.balance.quantity);
+        const tokenName = tokenInfo.balance.collection;
         
-        if (!shouldSkipGweth) {
-          // Try GWETH with the main trade size first
-          arbitrageOpportunity = await this.checkArbitrageOpportunity(
-            logger,
-            options.binanceApi,
-            options.galaChainRouter,
-            tradeSize,
-            'GALA',
-            'GWETH',
-            'GALAETH',
-            'ETHUSDT',
+        // Calculate valid trade sizes for this token
+        // For GALA, use the configured amounts; for others, use a percentage of balance
+        let maxTradeAmount: number;
+        if (tokenName === 'GALA') {
+          maxTradeAmount = this.GALA_AMOUNT;
+        } else {
+          // For other tokens, use up to 50% of balance or a reasonable amount
+          maxTradeAmount = Math.min(tokenBalance.toNumber() * 0.5, 10000);
+        }
+        
+        const validSizes = this.TRADE_SIZE_OPTIONS
+          .filter(size => size <= tokenBalance.toNumber() && size <= maxTradeAmount && size >= this.MIN_GALA_AMOUNT)
+          .sort((a, b) => a - b);
+        
+        if (validSizes.length === 0) {
+          logger.debug(
+            {
+              token: tokenName,
+              balance: tokenBalance.toString(),
+              minRequired: this.MIN_GALA_AMOUNT,
+            },
+            `Arbitrage: Skipping ${tokenName} - insufficient balance for minimum trade size`,
           );
-
-          // If GWETH fails due to CONFLICT (liquidity), increment failure counter
-          // Note: We check if the opportunity is null, which means it failed
-          // A successful quote (even if unprofitable) means the pool has liquidity
-          if (!arbitrageOpportunity) {
-            this.gwethFailureCount++;
-            this.gwethLastFailureTime = now;
-            if (this.gwethFailureCount >= this.GWETH_MAX_FAILURES) {
-              logger.warn(
-                {
-                  failureCount: this.gwethFailureCount,
-                  maxFailures: this.GWETH_MAX_FAILURES,
-                  retryAfter: new Date(now + this.GWETH_RETRY_INTERVAL).toISOString(),
-                  note: 'GWETH pool has insufficient liquidity. Will skip GWETH checks for 5 minutes.',
-                },
-                'GWETH circuit breaker activated - skipping GWETH checks',
-              );
-            } else {
-              logger.info(
-                {
-                  failureCount: this.gwethFailureCount,
-                  maxFailures: this.GWETH_MAX_FAILURES,
-                  tradeSize,
-                },
-                'Arbitrage: GWETH check failed (liquidity issue)',
-              );
-            }
-          } else {
-            // Reset failure counter on success (even if unprofitable, getting a quote means liquidity exists)
-            if (this.gwethFailureCount > 0) {
-              logger.info(
-                {
-                  previousFailures: this.gwethFailureCount,
-                  note: 'GWETH pool now has liquidity - resetting failure counter',
-                },
-                'GWETH arbitrage check succeeded (circuit breaker reset)',
-              );
-            }
-            this.gwethFailureCount = 0;
-          }
+          continue;
         }
 
-        // If GALA/GWETH still fails due to liquidity, try alternative pairs
-        if (!arbitrageOpportunity) {
+        logger.info(
+          {
+            token: tokenName,
+            balance: tokenBalance.toString(),
+            validSizes: validSizes,
+            binanceSymbol: tokenInfo.binanceSymbol,
+            totalSizes: validSizes.length,
+          },
+          `Arbitrage: Checking opportunities for ${tokenName}`,
+        );
+
+        // Check if we should skip GWETH due to recent failures (circuit breaker)
+        const now = Date.now();
+        const shouldSkipGweth = tokenName === 'GALA' && 
+                                this.gwethFailureCount >= this.GWETH_MAX_FAILURES && 
+                                (now - this.gwethLastFailureTime) < this.GWETH_RETRY_INTERVAL;
+        
+        if (shouldSkipGweth) {
           logger.info(
             {
-              tradeSize,
-              note: 'GALA/GWETH pair unavailable, trying alternative pairs',
+              failureCount: this.gwethFailureCount,
+              lastFailureTime: new Date(this.gwethLastFailureTime).toISOString(),
+              retryAfter: new Date(this.gwethLastFailureTime + this.GWETH_RETRY_INTERVAL).toISOString(),
+              note: 'GWETH pool has insufficient liquidity. Skipping GWETH checks temporarily.',
             },
-            'Arbitrage: Trying alternative pairs',
+            'Arbitrage: Skipping GWETH checks (circuit breaker active)',
           );
-          for (const pair of this.ALTERNATIVE_PAIRS) {
-            logger.info(
-              {
-                pair: pair.description,
-                tradeSize,
-              },
-              'Arbitrage: Checking alternative pair',
-            );
-            
-            arbitrageOpportunity = await this.checkArbitrageOpportunity(
-              logger,
-              options.binanceApi,
-              options.galaChainRouter,
+        }
+
+        // Try each trade size to find the most profitable opportunity for this token
+        for (const tradeSize of validSizes) {
+          logger.info(
+            {
+              token: tokenName,
               tradeSize,
-              pair.galaToken,
-              pair.receivingToken,
-              pair.binanceSymbol,
-              'USDT', // For stablecoins, we use USDT directly
-            );
-            
-            if (arbitrageOpportunity) {
-              logger.info(
-                {
-                  pair: pair.description,
-                  netProfit: arbitrageOpportunity.netProfit.toFixed(4),
-                  tradeSize,
-                  isProfitable: arbitrageOpportunity.netProfit > 0,
-                },
-                'Arbitrage: Found opportunity with alternative pair',
-              );
-              break; // Found a working pair, stop trying others
-            }
-          }
-        }
+              balance: tokenBalance.toString(),
+            },
+            `Arbitrage: Checking ${tokenName} opportunity with trade size`,
+          );
 
-        // Track all opportunities (even unprofitable ones) for summary
-        if (arbitrageOpportunity) {
-          allOpportunities.push({
-            tradeSize,
-            netProfit: arbitrageOpportunity.netProfit,
-            pair: arbitrageOpportunity.pair,
-            direction: 'GalaSwap->Binance',
-          });
-        }
-
-        // If we found an opportunity (profitable or loss if allowed), compare it with the best one so far
-        if (arbitrageOpportunity) {
-          const isProfitable = arbitrageOpportunity.netProfit > 0;
-          const isLossButAllowed = this.ALLOW_LOSS_TRADES && arbitrageOpportunity.netProfit <= 0;
+          let arbitrageOpportunity: ReturnType<typeof this.checkArbitrageOpportunity> extends Promise<infer T> ? T : null = null;
           
-          if (isProfitable || isLossButAllowed) {
-            // For profitable trades, pick the most profitable
-            // For loss trades, pick the one with smallest loss (least negative)
-            const isBetter = !bestOpportunity || 
-              (isProfitable && arbitrageOpportunity.netProfit > bestOpportunity.netProfit) ||
-              (isLossButAllowed && bestOpportunity.netProfit <= 0 && arbitrageOpportunity.netProfit > bestOpportunity.netProfit);
-            
-            if (isBetter) {
-              bestOpportunity = {
-                ...arbitrageOpportunity,
-                tradeAmount: tradeSize,
-                direction: 'GalaSwap->Binance',
-              };
-              if (isProfitable) {
+          // For GALA, try GWETH first, then stablecoins
+          if (tokenName === 'GALA') {
+            // Try GALA/GWETH first (primary pair) - but only if circuit breaker is not active
+            if (!shouldSkipGweth) {
+              arbitrageOpportunity = await this.checkArbitrageOpportunity(
+                logger,
+                options.binanceApi,
+                options.galaChainRouter,
+                tradeSize,
+                'GALA',
+                'GWETH',
+                'GALAETH',
+                'ETHUSDT',
+              );
+
+              // Handle GWETH circuit breaker
+              if (!arbitrageOpportunity) {
+                this.gwethFailureCount++;
+                this.gwethLastFailureTime = now;
+                if (this.gwethFailureCount >= this.GWETH_MAX_FAILURES) {
+                  logger.warn(
+                    {
+                      failureCount: this.gwethFailureCount,
+                      maxFailures: this.GWETH_MAX_FAILURES,
+                      retryAfter: new Date(now + this.GWETH_RETRY_INTERVAL).toISOString(),
+                      note: 'GWETH pool has insufficient liquidity. Will skip GWETH checks for 5 minutes.',
+                    },
+                    'GWETH circuit breaker activated - skipping GWETH checks',
+                  );
+                } else {
+                  logger.info(
+                    {
+                      failureCount: this.gwethFailureCount,
+                      maxFailures: this.GWETH_MAX_FAILURES,
+                      tradeSize,
+                    },
+                    'Arbitrage: GWETH check failed (liquidity issue)',
+                  );
+                }
+              } else {
+                if (this.gwethFailureCount > 0) {
+                  logger.info(
+                    {
+                      previousFailures: this.gwethFailureCount,
+                      note: 'GWETH pool now has liquidity - resetting failure counter',
+                    },
+                    'GWETH arbitrage check succeeded (circuit breaker reset)',
+                  );
+                }
+                this.gwethFailureCount = 0;
+              }
+            }
+
+            // If GALA/GWETH failed, try stablecoin pairs
+            if (!arbitrageOpportunity) {
+              for (const pair of this.ALTERNATIVE_PAIRS) {
                 logger.info(
                   {
+                    pair: pair.description,
                     tradeSize,
-                    netProfit: arbitrageOpportunity.netProfit,
-                    pair: arbitrageOpportunity.pair,
-                    direction: 'GalaSwap->Binance',
                   },
-                  'Found profitable arbitrage opportunity',
+                  'Arbitrage: Checking alternative pair',
                 );
-              } else {
-                logger.warn(
+                
+                arbitrageOpportunity = await this.checkArbitrageOpportunity(
+                  logger,
+                  options.binanceApi,
+                  options.galaChainRouter,
+                  tradeSize,
+                  pair.galaToken,
+                  pair.receivingToken,
+                  pair.binanceSymbol,
+                  'USDT',
+                );
+                
+                if (arbitrageOpportunity) {
+                  logger.info(
+                    {
+                      pair: pair.description,
+                      netProfit: arbitrageOpportunity.netProfit.toFixed(4),
+                      tradeSize,
+                      isProfitable: arbitrageOpportunity.netProfit > 0,
+                    },
+                    'Arbitrage: Found opportunity with alternative pair',
+                  );
+                  break;
+                }
+              }
+            }
+          } else {
+            // For other tokens (GWETH, etc.), try to sell for stablecoin and buy back on Binance
+            // Strategy: Sell token on GalaSwap for GUSDC/GUSDT, then buy token on Binance with that USDT value
+            const receivingTokens = ['GUSDC', 'GUSDT'];
+            
+            for (const receivingToken of receivingTokens) {
+              logger.info(
+                {
+                  token: tokenName,
+                  receivingToken,
+                  tradeSize,
+                  binanceSymbol: tokenInfo.binanceSymbol,
+                },
+                `Arbitrage: Checking ${tokenName}/${receivingToken} -> ${tokenInfo.binanceSymbol}`,
+              );
+              
+              // Check arbitrage: Sell token on GalaSwap for stablecoin, buy token on Binance
+              arbitrageOpportunity = await this.checkArbitrageOpportunity(
+                logger,
+                options.binanceApi,
+                options.galaChainRouter,
+                tradeSize,
+                tokenName,
+                receivingToken,
+                tokenInfo.binanceSymbol,
+                'USDT',
+              );
+              
+              if (arbitrageOpportunity) {
+                logger.info(
                   {
+                    token: tokenName,
+                    pair: `${tokenName}/${receivingToken} -> ${tokenInfo.binanceSymbol}`,
+                    netProfit: arbitrageOpportunity.netProfit.toFixed(4),
                     tradeSize,
-                    netProfit: arbitrageOpportunity.netProfit,
-                    pair: arbitrageOpportunity.pair,
-                    direction: 'GalaSwap->Binance',
-                    note: 'Loss trade selected (ALLOW_LOSS_TRADES enabled)',
+                    isProfitable: arbitrageOpportunity.netProfit > 0,
                   },
-                  '⚠️ Found loss arbitrage opportunity (will execute)',
+                  `Arbitrage: Found opportunity for ${tokenName}`,
                 );
+                break;
               }
             }
           }
-        }
-      }
 
-      // Check reverse direction: Binance -> GalaSwap (if GALA is cheaper on Binance)
-      // This requires USDT balance on Binance, so we'll check that first
-      try {
-        const binanceBalances = await options.binanceApi.getBalances();
-        const usdtBalance = binanceBalances.get('USDT');
-        const availableUsdt = usdtBalance ? parseFloat(usdtBalance.free) : 0;
-          
-        if (availableUsdt >= 10) { // Need at least $10 USDT to try reverse arbitrage
-          logger.info(
-            {
-              availableUsdt: availableUsdt.toFixed(2),
-            },
-            'Arbitrage: Checking reverse direction (Binance->GalaSwap)',
-          );
-
-          // Try reverse direction for each trade size
-          for (const tradeSize of validSizes) {
-            // Calculate how much USDT we need for this trade size
-            const galaPriceResponse = await options.binanceApi.getPrice('GALAUSDT');
-            if (!galaPriceResponse) continue;
-            
-            const galaPriceUsdt = Number(galaPriceResponse.price);
-            const usdtNeeded = tradeSize * galaPriceUsdt;
-            
-            if (usdtNeeded > availableUsdt) continue; // Skip if not enough USDT
-
-            // Check reverse arbitrage: Buy GALA on Binance, sell on GalaSwap
-            const reverseOpportunity = await this.checkReverseArbitrageOpportunity(
-              logger,
-              options.binanceApi,
-              options.galaChainRouter,
+          // Track all opportunities (even unprofitable ones) for summary
+          if (arbitrageOpportunity) {
+            allOpportunities.push({
               tradeSize,
-              usdtNeeded,
-            );
+              netProfit: arbitrageOpportunity.netProfit,
+              pair: arbitrageOpportunity.pair,
+              direction: 'GalaSwap->Binance',
+              token: tokenName,
+            });
 
-            if (reverseOpportunity) {
-              allOpportunities.push({
-                tradeSize,
-                netProfit: reverseOpportunity.netProfit,
-                pair: reverseOpportunity.pair,
-                direction: 'Binance->GalaSwap',
-              });
-
-              const isProfitable = reverseOpportunity.netProfit > 0;
-              const isLossButAllowed = this.ALLOW_LOSS_TRADES && reverseOpportunity.netProfit <= 0;
+            // If we found an opportunity (profitable or loss if allowed), compare it with the best one so far
+            const isProfitable = arbitrageOpportunity.netProfit > 0;
+            const isLossButAllowed = this.ALLOW_LOSS_TRADES && arbitrageOpportunity.netProfit <= 0;
+            
+            if (isProfitable || isLossButAllowed) {
+              // For profitable trades, pick the most profitable
+              // For loss trades, pick the one with smallest loss (least negative)
+              const isBetter = !bestOpportunity || 
+                (isProfitable && arbitrageOpportunity.netProfit > bestOpportunity.netProfit) ||
+                (isLossButAllowed && bestOpportunity.netProfit <= 0 && arbitrageOpportunity.netProfit > bestOpportunity.netProfit);
               
-              if (isProfitable || isLossButAllowed) {
-                const isBetter = !bestOpportunity || 
-                  (isProfitable && reverseOpportunity.netProfit > bestOpportunity.netProfit) ||
-                  (isLossButAllowed && bestOpportunity.netProfit <= 0 && reverseOpportunity.netProfit > bestOpportunity.netProfit);
-                
-                if (isBetter) {
-                  bestOpportunity = {
-                    ...reverseOpportunity,
-                    tradeAmount: tradeSize,
-                    direction: 'Binance->GalaSwap',
-                  };
-                  if (isProfitable) {
-                    logger.info(
-                      {
-                        tradeSize,
-                        netProfit: reverseOpportunity.netProfit,
-                        pair: reverseOpportunity.pair,
-                        direction: 'Binance->GalaSwap',
-                      },
-                      'Found profitable reverse arbitrage opportunity',
-                    );
-                  } else {
-                    logger.warn(
-                      {
-                        tradeSize,
-                        netProfit: reverseOpportunity.netProfit,
-                        pair: reverseOpportunity.pair,
-                        direction: 'Binance->GalaSwap',
-                        note: 'Loss trade selected (ALLOW_LOSS_TRADES enabled)',
-                      },
-                      '⚠️ Found loss reverse arbitrage opportunity (will execute)',
-                    );
-                  }
+              if (isBetter) {
+                bestOpportunity = {
+                  ...arbitrageOpportunity,
+                  tradeAmount: tradeSize,
+                  direction: 'GalaSwap->Binance',
+                  token: tokenName,
+                };
+                if (isProfitable) {
+                  logger.info(
+                    {
+                      token: tokenName,
+                      tradeSize,
+                      netProfit: arbitrageOpportunity.netProfit,
+                      pair: arbitrageOpportunity.pair,
+                      direction: 'GalaSwap->Binance',
+                    },
+                    `Arbitrage: Found profitable opportunity for ${tokenName}`,
+                  );
+                } else {
+                  logger.warn(
+                    {
+                      token: tokenName,
+                      tradeSize,
+                      netProfit: arbitrageOpportunity.netProfit,
+                      pair: arbitrageOpportunity.pair,
+                      direction: 'GalaSwap->Binance',
+                      note: 'Loss trade selected (ALLOW_LOSS_TRADES enabled)',
+                    },
+                    `⚠️ Arbitrage: Found loss opportunity for ${tokenName} (will execute)`,
+                  );
                 }
               }
             }
           }
-        } else {
-          logger.info(
-            {
-              availableUsdt: availableUsdt.toFixed(2),
-              minRequired: 10,
-            },
-            'Arbitrage: Skipping reverse direction (insufficient USDT on Binance)',
-          );
         }
-      } catch (error) {
-        logger.warn(
-          {
-            error: error instanceof Error ? error.message : String(error),
-          },
-          'Failed to check reverse arbitrage direction (Binance->GalaSwap)',
-        );
-      }
+
+        // Check reverse direction: Binance -> GalaSwap (for tokens that have Binance equivalents)
+        // This requires USDT balance on Binance
+        if (tokenName !== 'GUSDC' && tokenName !== 'GUSDT') {
+          try {
+            const binanceBalances = await options.binanceApi.getBalances();
+            const usdtBalance = binanceBalances.get('USDT');
+            const availableUsdt = usdtBalance ? parseFloat(usdtBalance.free) : 0;
+              
+            if (availableUsdt >= 10) { // Need at least $10 USDT to try reverse arbitrage
+              logger.info(
+                {
+                  token: tokenName,
+                  availableUsdt: availableUsdt.toFixed(2),
+                },
+                `Arbitrage: Checking reverse direction for ${tokenName} (Binance->GalaSwap)`,
+              );
+
+              // Try reverse direction for each trade size
+              for (const tradeSize of validSizes) {
+                // Get token price on Binance to calculate USDT needed
+                const tokenPriceResponse = await options.binanceApi.getPrice(tokenInfo.binanceSymbol);
+                if (!tokenPriceResponse) continue;
+                
+                const tokenPriceUsdt = Number(tokenPriceResponse.price);
+                const usdtNeeded = tradeSize * tokenPriceUsdt;
+                
+                if (usdtNeeded > availableUsdt) continue; // Skip if not enough USDT
+
+                // Check reverse arbitrage: Buy token on Binance, sell on GalaSwap
+                // For now, only implement reverse for GALA (can be extended later)
+                if (tokenName === 'GALA') {
+                  const reverseOpportunity = await this.checkReverseArbitrageOpportunity(
+                    logger,
+                    options.binanceApi,
+                    options.galaChainRouter,
+                    tradeSize,
+                    usdtNeeded,
+                  );
+
+                  if (reverseOpportunity) {
+                    allOpportunities.push({
+                      tradeSize,
+                      netProfit: reverseOpportunity.netProfit,
+                      pair: reverseOpportunity.pair,
+                      direction: 'Binance->GalaSwap',
+                      token: tokenName,
+                    });
+
+                    const isProfitable = reverseOpportunity.netProfit > 0;
+                    const isLossButAllowed = this.ALLOW_LOSS_TRADES && reverseOpportunity.netProfit <= 0;
+                    
+                    if (isProfitable || isLossButAllowed) {
+                      const isBetter = !bestOpportunity || 
+                        (isProfitable && reverseOpportunity.netProfit > bestOpportunity.netProfit) ||
+                        (isLossButAllowed && bestOpportunity.netProfit <= 0 && reverseOpportunity.netProfit > bestOpportunity.netProfit);
+                      
+                      if (isBetter) {
+                        bestOpportunity = {
+                          ...reverseOpportunity,
+                          tradeAmount: tradeSize,
+                          direction: 'Binance->GalaSwap',
+                          token: tokenName,
+                        };
+                        if (isProfitable) {
+                          logger.info(
+                            {
+                              token: tokenName,
+                              tradeSize,
+                              netProfit: reverseOpportunity.netProfit,
+                              pair: reverseOpportunity.pair,
+                              direction: 'Binance->GalaSwap',
+                            },
+                            `Arbitrage: Found profitable reverse opportunity for ${tokenName}`,
+                          );
+                        } else {
+                          logger.warn(
+                            {
+                              token: tokenName,
+                              tradeSize,
+                              netProfit: reverseOpportunity.netProfit,
+                              pair: reverseOpportunity.pair,
+                              direction: 'Binance->GalaSwap',
+                              note: 'Loss trade selected (ALLOW_LOSS_TRADES enabled)',
+                            },
+                            `⚠️ Arbitrage: Found loss reverse opportunity for ${tokenName} (will execute)`,
+                          );
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            } else {
+              logger.debug(
+                {
+                  token: tokenName,
+                  availableUsdt: availableUsdt.toFixed(2),
+                  minRequired: 10,
+                },
+                `Arbitrage: Skipping reverse direction for ${tokenName} (insufficient USDT on Binance)`,
+              );
+            }
+          } catch (error) {
+            logger.warn(
+              {
+                token: tokenName,
+                error: error instanceof Error ? error.message : String(error),
+              },
+              `Failed to check reverse arbitrage direction for ${tokenName} (Binance->GalaSwap)`,
+            );
+          }
+        }
+      } // End of loop through arbitrageableTokens
 
       const arbitrageOpportunity = bestOpportunity;
 
@@ -572,9 +731,10 @@ export class ArbitrageStrategy implements ISwapStrategy {
                 status: bestUnprofitable.netProfit > 0 ? 'Profitable but below minimum' : 'UNPROFITABLE (would lose money)',
               },
               minRequiredProfit: `${this.MIN_PROFIT_GALA} GALA`,
-              gwethStatus: shouldSkipGweth 
+              gwethStatus: this.gwethFailureCount >= this.GWETH_MAX_FAILURES 
                 ? `Skipped (circuit breaker: ${this.gwethFailureCount} failures)` 
                 : 'Checked',
+              tokensChecked: arbitrageableTokens.map(t => t.balance.collection),
               note: 'All opportunities are unprofitable. Bot is correctly protecting funds by NOT executing losing trades.',
             },
             'Arbitrage: Check complete - No profitable opportunities found',
@@ -582,25 +742,29 @@ export class ArbitrageStrategy implements ISwapStrategy {
         } else {
           logger.info(
             {
-              checkedSizes: validSizes,
-              availableBalance: availableGala.toString(),
-              gwethStatus: shouldSkipGweth 
+              tokensChecked: arbitrageableTokens.map(t => ({
+                token: t.balance.collection,
+                balance: t.balance.quantity,
+              })),
+              gwethStatus: this.gwethFailureCount >= this.GWETH_MAX_FAILURES 
                 ? `Skipped (circuit breaker: ${this.gwethFailureCount} failures)` 
                 : 'Checked',
               note: 'No arbitrage opportunities found (likely due to liquidity issues or price parity)',
             },
-            'Arbitrage: No opportunities found across all trade sizes',
+            'Arbitrage: No opportunities found across all tokens',
           );
         }
       }
       
       // Always log a summary at the end of each check
+      const tokensChecked = arbitrageableTokens.map(t => t.balance.collection);
       logger.info(
         {
           totalOpportunitiesChecked: allOpportunities.length,
           profitableOpportunities: allOpportunities.filter(o => o.netProfit > 0 && o.netProfit >= this.MIN_PROFIT_GALA).length,
           unprofitableOpportunities: allOpportunities.filter(o => o.netProfit <= 0).length,
-          tradeSizesChecked: validSizes.length,
+          tokensChecked: tokensChecked,
+          uniqueTokens: [...new Set(tokensChecked)],
           nextCheckIn: `${Math.round(this.ARBITRAGE_CHECK_INTERVAL / 1000)}s`,
         },
         'Arbitrage: Check cycle complete',
