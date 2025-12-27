@@ -179,39 +179,12 @@ export class ArbitrageStrategy implements ISwapStrategy {
       }
     }
 
-    // Also check stablecoins (GUSDC/GUSDT) - they map to USDT
-    // Only add if they weren't already added in the first loop (check by token key)
-    for (const balance of ownBalances) {
-      if (balance.collection === 'GUSDC' || balance.collection === 'GUSDT') {
-        const tokenKey: ITokenClassKey = {
-          collection: balance.collection,
-          category: balance.category,
-          type: balance.type,
-          additionalKey: balance.additionalKey,
-        };
-        
-        // Check if already added (avoid duplicates)
-        const alreadyAdded = arbitrageableTokens.some(
-          t => t.tokenKey.collection === tokenKey.collection &&
-               t.tokenKey.category === tokenKey.category &&
-               t.tokenKey.type === tokenKey.type &&
-               t.tokenKey.additionalKey === tokenKey.additionalKey
-        );
-        
-        if (!alreadyAdded) {
-          // Stablecoins are 1:1 with USDT, so we can arbitrage them
-          const balanceAmount = BigNumber(balance.quantity);
-          if (balanceAmount.isGreaterThan(10)) { // Need at least $10 worth
-            arbitrageableTokens.push({
-              balance,
-              binanceSymbol: 'USDT', // Will use USDT directly
-              quoteCurrency: 'USDT',
-              tokenKey,
-            });
-          }
-        }
-      }
-    }
+    // Skip stablecoins (GUSDC/GUSDT) from arbitrage checking
+    // They are 1:1 with USDT, so there's no arbitrage opportunity
+    // If you want to use stablecoins for arbitrage, you'd need to:
+    // 1. Swap stablecoin -> GALA on GalaSwap
+    // 2. Buy GALA on Binance with USDT
+    // But this is essentially the same as GALA arbitrage, so we skip stablecoins
 
     if (arbitrageableTokens.length === 0) {
       logger.info(
@@ -449,9 +422,10 @@ export class ArbitrageStrategy implements ISwapStrategy {
                 }
               }
             }
-          } else {
+          } else if (tokenName !== 'GUSDC' && tokenName !== 'GUSDT') {
             // For other tokens (GWETH, etc.), try to sell for stablecoin and buy back on Binance
             // Strategy: Sell token on GalaSwap for GUSDC/GUSDT, then buy token on Binance with that USDT value
+            // Skip stablecoins themselves - they're already 1:1 with USDT, no arbitrage opportunity
             const receivingTokens = ['GUSDC', 'GUSDT'];
             
             for (const receivingToken of receivingTokens) {
@@ -491,6 +465,16 @@ export class ArbitrageStrategy implements ISwapStrategy {
                 break;
               }
             }
+          } else {
+            // Skip stablecoins - they're 1:1 with USDT, no arbitrage opportunity
+            logger.debug(
+              {
+                token: tokenName,
+                note: 'Stablecoins are 1:1 with USDT, skipping arbitrage check',
+              },
+              `Arbitrage: Skipping ${tokenName} (stablecoin, no arbitrage opportunity)`,
+            );
+            continue;
           }
 
           // Track all opportunities (even unprofitable ones) for summary
