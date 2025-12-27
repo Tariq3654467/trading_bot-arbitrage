@@ -50,6 +50,22 @@ export class BinanceTrading {
       throw new Error('Binance trading is not enabled');
     }
 
+    return this.executeTradeInternal(trade);
+  }
+
+  /**
+   * Execute a trade for arbitrage purposes (bypasses enabled check)
+   * This allows arbitrage strategy to execute trades even when general Binance trading is disabled
+   */
+  async executeTradeForArbitrage(trade: IBinanceTrade): Promise<IBinanceOrder> {
+    this.logger?.info({
+      message: 'Executing Binance trade for arbitrage (bypassing enabled check)',
+      trade,
+    });
+    return this.executeTradeInternal(trade);
+  }
+
+  private async executeTradeInternal(trade: IBinanceTrade): Promise<IBinanceOrder> {
     // Validate trade amount
     const tradeAmount = trade.price
       ? BigNumber(trade.quantity).multipliedBy(trade.price)

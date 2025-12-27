@@ -1088,7 +1088,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
           );
 
           // For GALAETH pair, market BUY uses quoteOrderQty (amount in ETH)
-          await binanceTrading.executeTrade({
+          await binanceTrading.executeTradeForArbitrage({
             symbol: 'GALAETH',
             side: 'BUY',
             type: 'MARKET',
@@ -1139,12 +1139,12 @@ export class ArbitrageStrategy implements ISwapStrategy {
         );
 
         // For GALAUSDT pair, market BUY uses quoteOrderQty (amount in USDT)
-        // The executeTrade function will automatically convert quantity to quoteOrderQty for market BUY
+        // The executeTradeForArbitrage function will automatically convert quantity to quoteOrderQty for market BUY
         if (!binanceTrading) {
           throw new Error('BinanceTrading is not available - cannot execute Binance trade');
         }
         
-        await binanceTrading.executeTrade({
+        await binanceTrading.executeTradeForArbitrage({
           symbol: 'GALAUSDT',
           side: 'BUY',
           type: 'MARKET',
@@ -1235,7 +1235,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
         'Executing Binance BUY order',
       );
 
-      const binanceOrder = await binanceTrading.executeTrade({
+      const binanceOrder = await binanceTrading.executeTradeForArbitrage({
         symbol: 'GALAUSDT',
         side: 'BUY',
         type: 'MARKET',
