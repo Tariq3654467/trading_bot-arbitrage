@@ -39,9 +39,9 @@ export class ArbitrageStrategy implements ISwapStrategy {
   // GalaSwap fees: Use actual fee tier from quote (0.05%, 0.30%, or 1.00%)
   // Fee tiers: 500 = 0.05% (stable pairs), 3000 = 0.30% (most pairs), 10000 = 1.00% (volatile pairs)
   private readonly GAS_FEE_GALA: number = 0.5; // Optimized gas estimate (actual is typically 0.1-0.5 GALA)
-  private readonly MIN_GALA_AMOUNT: number = 1000; // Minimum amount to attempt (to avoid CONFLICT errors)
+  private readonly MIN_GALA_AMOUNT: number = 500; // Minimum amount to attempt (reduced to allow smaller balances)
   // Try different trade sizes to find profitable opportunities (smaller sizes = less slippage)
-  private readonly TRADE_SIZE_OPTIONS: number[] = [1000, 2000, 3000, 4000, 5000]; // Try smaller sizes first
+  private readonly TRADE_SIZE_OPTIONS: number[] = [500, 1000, 2000, 3000, 4000, 5000]; // Try smaller sizes first (added 500)
   
   // Alternative pairs to try if GALA/GWETH has insufficient liquidity
   private readonly ALTERNATIVE_PAIRS = [
