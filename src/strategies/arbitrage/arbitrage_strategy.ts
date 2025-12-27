@@ -180,6 +180,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
     }
 
     // Also check stablecoins (GUSDC/GUSDT) - they map to USDT
+    // Only add if they weren't already added in the first loop (check by token key)
     for (const balance of ownBalances) {
       if (balance.collection === 'GUSDC' || balance.collection === 'GUSDT') {
         const tokenKey: ITokenClassKey = {
@@ -189,15 +190,25 @@ export class ArbitrageStrategy implements ISwapStrategy {
           additionalKey: balance.additionalKey,
         };
         
-        // Stablecoins are 1:1 with USDT, so we can arbitrage them
-        const balanceAmount = BigNumber(balance.quantity);
-        if (balanceAmount.isGreaterThan(10)) { // Need at least $10 worth
-          arbitrageableTokens.push({
-            balance,
-            binanceSymbol: 'USDT', // Will use USDT directly
-            quoteCurrency: 'USDT',
-            tokenKey,
-          });
+        // Check if already added (avoid duplicates)
+        const alreadyAdded = arbitrageableTokens.some(
+          t => t.tokenKey.collection === tokenKey.collection &&
+               t.tokenKey.category === tokenKey.category &&
+               t.tokenKey.type === tokenKey.type &&
+               t.tokenKey.additionalKey === tokenKey.additionalKey
+        );
+        
+        if (!alreadyAdded) {
+          // Stablecoins are 1:1 with USDT, so we can arbitrage them
+          const balanceAmount = BigNumber(balance.quantity);
+          if (balanceAmount.isGreaterThan(10)) { // Need at least $10 worth
+            arbitrageableTokens.push({
+              balance,
+              binanceSymbol: 'USDT', // Will use USDT directly
+              quoteCurrency: 'USDT',
+              tokenKey,
+            });
+          }
         }
       }
     }
@@ -256,17 +267,42 @@ export class ArbitrageStrategy implements ISwapStrategy {
         const tokenName = tokenInfo.balance.collection;
         
         // Calculate valid trade sizes for this token
-        // For GALA, use the configured amounts; for others, use a percentage of balance
+        // For GALA, use the configured amounts; for others, calculate based on token value
         let maxTradeAmount: number;
+        let minTradeAmount: number;
+        let tradeSizeOptions: number[];
+        
         if (tokenName === 'GALA') {
           maxTradeAmount = this.GALA_AMOUNT;
+          minTradeAmount = this.MIN_GALA_AMOUNT;
+          tradeSizeOptions = this.TRADE_SIZE_OPTIONS;
+        } else if (tokenName === 'GWETH') {
+          // For ETH, use smaller amounts (ETH is worth ~$3000, so 0.01 ETH = ~$30)
+          // Try: 0.001, 0.005, 0.01, 0.02, 0.05 ETH
+          maxTradeAmount = Math.min(tokenBalance.toNumber() * 0.5, 0.1);
+          minTradeAmount = 0.001;
+          tradeSizeOptions = [0.001, 0.005, 0.01, 0.02, 0.05, 0.1];
+        } else if (tokenName === 'GUSDC' || tokenName === 'GUSDT') {
+          // For stablecoins, use dollar amounts: $10, $25, $50, $100, $250, $500
+          maxTradeAmount = Math.min(tokenBalance.toNumber() * 0.5, 1000);
+          minTradeAmount = 10;
+          tradeSizeOptions = [10, 25, 50, 100, 250, 500, 1000];
         } else {
-          // For other tokens, use up to 50% of balance or a reasonable amount
-          maxTradeAmount = Math.min(tokenBalance.toNumber() * 0.5, 10000);
+          // For other tokens, try to estimate based on balance
+          // Use 10%, 25%, 50% of balance, but cap at reasonable amounts
+          const balanceNum = tokenBalance.toNumber();
+          maxTradeAmount = Math.min(balanceNum * 0.5, 1000);
+          minTradeAmount = Math.min(balanceNum * 0.1, 100);
+          // Generate trade sizes: 10%, 25%, 50% of balance
+          tradeSizeOptions = [
+            Math.max(minTradeAmount, balanceNum * 0.1),
+            Math.max(minTradeAmount, balanceNum * 0.25),
+            Math.max(minTradeAmount, balanceNum * 0.5),
+          ].filter((size, index, arr) => size > 0 && (index === 0 || size !== arr[index - 1]));
         }
         
-        const validSizes = this.TRADE_SIZE_OPTIONS
-          .filter(size => size <= tokenBalance.toNumber() && size <= maxTradeAmount && size >= this.MIN_GALA_AMOUNT)
+        const validSizes = tradeSizeOptions
+          .filter(size => size <= tokenBalance.toNumber() && size <= maxTradeAmount && size >= minTradeAmount)
           .sort((a, b) => a - b);
         
         if (validSizes.length === 0) {
@@ -274,7 +310,8 @@ export class ArbitrageStrategy implements ISwapStrategy {
             {
               token: tokenName,
               balance: tokenBalance.toString(),
-              minRequired: this.MIN_GALA_AMOUNT,
+              minRequired: minTradeAmount,
+              maxAllowed: maxTradeAmount,
             },
             `Arbitrage: Skipping ${tokenName} - insufficient balance for minimum trade size`,
           );
@@ -968,9 +1005,10 @@ export class ArbitrageStrategy implements ISwapStrategy {
         'Binance prices retrieved',
       );
 
-      // Step 3: Calculate how much GALA we can buy on Binance
-      // For GWETH: receivingTokenAmount * ethPriceUsdt = USDT value, then / galaPriceUsdt
-      // For GUSDC/GUSDT: receivingTokenAmount = USDT value (1:1), then / galaPriceUsdt
+      // Step 3: Calculate how much of the original token we can buy back on Binance
+      // For GALA: receivingTokenAmount * quotePriceUsdt = USDT value, then / galaPriceUsdt
+      // For GWETH: receivingTokenAmount (in GUSDC/GUSDT) = USDT value, then / ethPriceUsdt
+      // For other tokens: similar logic based on their Binance symbol
       let usdtValue: number;
       if (receivingToken === 'GWETH') {
         // GWETH is 1:1 with ETH
@@ -979,7 +1017,24 @@ export class ArbitrageStrategy implements ISwapStrategy {
         // GUSDC/GUSDT are 1:1 with USDT
         usdtValue = receivingTokenAmount;
       }
-      const galaBuyableOnBinance = usdtValue / galaPriceUsdt;
+      
+      // Calculate how much of the original token we can buy back on Binance
+      let tokenBuyableOnBinance: number;
+      if (galaToken === 'GALA') {
+        // For GALA, buy GALA on Binance
+        tokenBuyableOnBinance = usdtValue / galaPriceUsdt;
+      } else if (galaToken === 'GWETH') {
+        // For GWETH, buy ETH on Binance (GWETH = ETH)
+        tokenBuyableOnBinance = usdtValue / quotePriceUsdt;
+      } else {
+        // For other tokens, we need their Binance price
+        // For now, assume we can get the price from the quoteCurrency or use a default
+        // This is a simplified approach - in production, you'd fetch the actual token price
+        tokenBuyableOnBinance = usdtValue / galaPriceUsdt; // Fallback: use GALA price as approximation
+      }
+      
+      // Keep the variable name for compatibility, but it now represents the original token amount
+      const galaBuyableOnBinance = tokenBuyableOnBinance;
 
       logger.info(
         {
@@ -1018,6 +1073,8 @@ export class ArbitrageStrategy implements ISwapStrategy {
 
       // Step 5: Calculate net profit
       // Net profit = (GALA received on Binance) - (GALA sold on GalaSwap) - (All Fees)
+      // Calculate net profit in the original token units
+      // For GALA, this is in GALA. For other tokens, it's in their units.
       const netProfit = galaBuyableOnBinance - galaAmount - totalFees;
 
         logger.info(

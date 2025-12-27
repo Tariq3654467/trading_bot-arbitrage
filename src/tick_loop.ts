@@ -245,6 +245,12 @@ export async function mainLoopTick(
     );
 
     // Execute each strategy and act on the results it returns (if any).
+    // Add binanceMappingConfig to options for strategies that need it
+    const strategyOptions = {
+      ...options,
+      binanceMappingConfig,
+    };
+    
     for (const strategy of strategies) {
       const { swapsToAccept, swapsToCreate, swapsToTerminate } = await strategy.doTick(
         logger,
@@ -257,7 +263,7 @@ export async function mainLoopTick(
         ownBalances,
         ownSwaps,
         allTokenValues,
-        options,
+        strategyOptions,
       );
 
       const hasActionToTake =
