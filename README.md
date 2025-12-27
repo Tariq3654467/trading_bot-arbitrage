@@ -131,8 +131,4 @@ npm install
 
 Add strategies in `src/strategies/` and import them in `src/bot_main.ts`.
 
-## Disclaimer
 
-This bot is provided "as is" without warranties. Trading cryptocurrencies involves risk of loss. Gala Games does not provide financial advice. You are responsible for compliance with local laws and regulations. Use at your own risk.
-
-By using this bot, you acknowledge that you have read and agree to the terms outlined in the [LICENSE](./LICENSE) file.
