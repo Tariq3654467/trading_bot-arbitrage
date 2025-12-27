@@ -148,7 +148,16 @@ export class ArbitrageStrategy implements ISwapStrategy {
         netProfit: number;
         pair: string;
         tradeAmount: number;
+        direction?: 'GalaSwap->Binance' | 'Binance->GalaSwap';
       } | null = null;
+
+      // Track all opportunities for summary logging
+      const allOpportunities: Array<{
+        tradeSize: number;
+        netProfit: number;
+        pair: string;
+        direction: string;
+      }> = [];
 
       // Try each trade size to find the most profitable opportunity
       for (const tradeSize of validSizes) {
