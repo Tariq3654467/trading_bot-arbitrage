@@ -18,22 +18,17 @@ import { ILogger, ITokenClassKey } from '../../types/types.js';
 import { ISwapStrategy, ISwapToAccept, ISwapToCreate, ISwapToTerminate } from '../swap_strategy.js';
 
 /**
- * Spatial Arbitrage Strategy (OPTIMIZED FOR MINOR PROFITS)
+ * Simple Price Gap Arbitrage Strategy
  * 
- * Goal: Find price differences between GalaSwap and Binance to net 0.5-30 GALA profit
+ * Goal: Compare GALA prices between GalaSwap and Binance, execute when profitable
  * 
- * Strategy:
- * 1. Sell GALA on GalaSwap for GWETH/GUSDC
- * 2. Convert receiving token value to USDT/ETH value
- * 3. Buy GALA on Binance with that value
- * 4. Net profit = (GALA received on Binance) - (GALA sold on GalaSwap) - (Fees)
+ * Simple Strategy:
+ * 1. Get GALA price on GalaSwap (from quote)
+ * 2. Get GALA price on Binance
+ * 3. Calculate price gap
+ * 4. If gap > fees + minimum profit → EXECUTE
  * 
- * Fee Optimizations:
- * - Uses LIMIT orders on Binance (0.02% maker fee instead of 0.1% market fee = 80% savings!)
- * - Reduced gas fee estimate (0.2 GALA instead of 0.5 GALA)
- * - Minimum profit threshold reduced to 0.5 GALA to capture minor opportunities
- * 
- * Execution: Only execute if profit >= MIN_PROFIT_GALA (0.5 GALA)
+ * No complex calculations - just pure price comparison!
  */
 export class ArbitrageStrategy implements ISwapStrategy {
   private readonly GALA_AMOUNT: number = 5000; // Maximum amount of GALA to trade
@@ -996,10 +991,11 @@ export class ArbitrageStrategy implements ISwapStrategy {
         'Binance prices retrieved',
       );
 
-      // Step 3: Calculate how much of the original token we can buy back on Binance
-      // For GALA: receivingTokenAmount * quotePriceUsdt = USDT value, then / galaPriceUsdt
-      // For GWETH: receivingTokenAmount (in GUSDC/GUSDT) = USDT value, then / ethPriceUsdt
-      // For other tokens: similar logic based on their Binance symbol
+      // SIMPLE PRICE COMPARISON:
+      // Step 3: Calculate effective GALA price on GalaSwap (what we get per GALA sold)
+      // Then compare with Binance GALA price
+      
+      // Convert receiving token to USDT value
       let usdtValue: number;
       if (receivingToken === 'GWETH') {
         // GWETH is 1:1 with ETH
@@ -1009,32 +1005,31 @@ export class ArbitrageStrategy implements ISwapStrategy {
         usdtValue = receivingTokenAmount;
       }
       
-      // Calculate how much of the original token we can buy back on Binance
-      let tokenBuyableOnBinance: number;
-      if (galaToken === 'GALA') {
-        // For GALA, buy GALA on Binance
-        tokenBuyableOnBinance = usdtValue / galaPriceUsdt;
-      } else if (galaToken === 'GWETH') {
-        // For GWETH, buy ETH on Binance (GWETH = ETH)
-        tokenBuyableOnBinance = usdtValue / quotePriceUsdt;
-      } else {
-        // For other tokens, we need their Binance price
-        // For now, assume we can get the price from the quoteCurrency or use a default
-        // This is a simplified approach - in production, you'd fetch the actual token price
-        tokenBuyableOnBinance = usdtValue / galaPriceUsdt; // Fallback: use GALA price as approximation
-      }
+      // Calculate effective GALA price on GalaSwap (USDT per GALA)
+      const galaSwapEffectivePrice = usdtValue / galaAmount;
       
-      // Keep the variable name for compatibility, but it now represents the original token amount
-      const galaBuyableOnBinance = tokenBuyableOnBinance;
+      // Binance GALA price (already in USDT)
+      const binanceGalaPrice = galaPriceUsdt;
+      
+      // Calculate how much GALA we can buy back on Binance with the USDT we got
+      const galaBuyableOnBinance = usdtValue / binanceGalaPrice;
+      
+      // PRICE GAP: Compare prices directly
+      const priceGap = binanceGalaPrice - galaSwapEffectivePrice;
+      const priceGapPercent = (priceGap / galaSwapEffectivePrice) * 100;
 
       logger.info(
         {
+          galaSwapEffectivePrice: galaSwapEffectivePrice.toFixed(8),
+          binanceGalaPrice: binanceGalaPrice.toFixed(8),
+          priceGap: priceGap.toFixed(8),
+          priceGapPercent: priceGapPercent.toFixed(2) + '%',
           receivingTokenAmount,
           receivingToken,
           usdtValue,
           galaBuyableOnBinance,
         },
-        'Calculated GALA buyable on Binance',
+        'Price comparison: GalaSwap vs Binance',
       );
 
       // Step 4: Calculate fees (using actual rates to minimize)
@@ -1062,29 +1057,41 @@ export class ArbitrageStrategy implements ISwapStrategy {
       const potentialMakerFee = galaBuyableOnBinance * this.BINANCE_MAKER_FEE_RATE;
       const feeSavings = binanceFee - potentialMakerFee;
 
-      // Step 5: Calculate net profit
-      // Net profit = (GALA received on Binance) - (GALA sold on GalaSwap) - (All Fees)
-      // Calculate net profit in the original token units
-      // For GALA, this is in GALA. For other tokens, it's in their units.
+      // Step 5: Calculate net profit from price gap
+      // Simple formula: Price gap * amount - fees
+      // If Binance price > GalaSwap price, we profit by buying on Binance what we sold on GalaSwap
       const netProfit = galaBuyableOnBinance - galaAmount - totalFees;
+      
+      // Alternative calculation: Price gap in GALA terms
+      const priceGapInGala = (priceGap * galaAmount) / binanceGalaPrice;
 
         logger.info(
           {
-            galaSold: galaAmount,
-            galaReceived: galaBuyableOnBinance,
+            priceComparison: {
+              galaSwapPrice: galaSwapEffectivePrice.toFixed(8),
+              binancePrice: binanceGalaPrice.toFixed(8),
+              priceGap: priceGap.toFixed(8),
+              priceGapPercent: priceGapPercent.toFixed(2) + '%',
+            },
+            trade: {
+              galaSold: galaAmount,
+              galaReceived: galaBuyableOnBinance,
+            },
             fees: {
               galaSwapFee: estimatedGalaSwapFee.toFixed(4),
               galaSwapFeeRate: `${(actualGalaSwapFeeRate * 100).toFixed(2)}%`,
-              note: 'GalaSwap fee already included in quote amountOut',
               binanceFee: binanceFee.toFixed(4),
               binanceFeeRate: `${(binanceFeeRate * 100).toFixed(2)}%`,
               binanceOrderType: this.USE_LIMIT_ORDERS ? 'LIMIT (maker)' : 'MARKET',
               gasFee: gasFee.toFixed(4),
               totalFees: totalFees.toFixed(4),
             },
-            netProfit: netProfit.toFixed(4),
+            profit: {
+              netProfit: netProfit.toFixed(4),
+              priceGapInGala: priceGapInGala.toFixed(4),
+            },
           },
-          'Arbitrage calculation complete (fees minimized)',
+          'Price gap arbitrage: Price comparison complete',
         );
 
       return {
