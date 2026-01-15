@@ -954,7 +954,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
                   },
                   `Arbitrage: Found opportunity for ${tokenName}`,
                 );
-                break;
+                // Continue checking other pairs for this trade size to find the best opportunity
               }
             }
           }
@@ -977,16 +977,15 @@ export class ArbitrageStrategy implements ISwapStrategy {
             const isLossButAllowed = (this.ALLOW_LOSS_TRADES || isGalaToGweth) && 
                                      arbitrageOpportunity.netProfit <= 0 && 
                                      arbitrageOpportunity.netProfit >= minProfitRequired;
-            // Also allow if profitable but below threshold for non-GWETH pairs
-            const isProfitableButBelowThreshold = !isGalaToGweth && 
-                                                  arbitrageOpportunity.netProfit > 0 && 
-                                                  arbitrageOpportunity.netProfit < minProfitRequired;
+            // Allow ANY profitable trade (other bots execute profitable trades regardless of threshold)
+            // For loss trades, only allow if they meet the special threshold
+            const canExecute = isProfitable || isLossButAllowed;
             
-            if (isProfitable || isLossButAllowed) {
+            if (canExecute) {
               // For profitable trades, pick the most profitable
               // For loss trades, pick the one with smallest loss (least negative)
               const isBetter = !bestOpportunity || 
-                (isProfitable && arbitrageOpportunity.netProfit > bestOpportunity.netProfit) ||
+                (isProfitable && (!bestOpportunity.netProfit || bestOpportunity.netProfit <= 0 || arbitrageOpportunity.netProfit > bestOpportunity.netProfit)) ||
                 (isLossButAllowed && bestOpportunity.netProfit <= 0 && arbitrageOpportunity.netProfit > bestOpportunity.netProfit);
               
               if (isBetter) {
@@ -1077,10 +1076,12 @@ export class ArbitrageStrategy implements ISwapStrategy {
 
                     const isProfitable = reverseOpportunity.netProfit > 0;
                     const isLossButAllowed = this.ALLOW_LOSS_TRADES && reverseOpportunity.netProfit <= 0;
+                    // Allow ANY profitable trade (other bots execute profitable trades regardless of threshold)
+                    const canExecute = isProfitable || isLossButAllowed;
                     
-                    if (isProfitable || isLossButAllowed) {
+                    if (canExecute) {
                       const isBetter = !bestOpportunity || 
-                        (isProfitable && reverseOpportunity.netProfit > bestOpportunity.netProfit) ||
+                        (isProfitable && (!bestOpportunity.netProfit || bestOpportunity.netProfit <= 0 || reverseOpportunity.netProfit > bestOpportunity.netProfit)) ||
                         (isLossButAllowed && bestOpportunity.netProfit <= 0 && reverseOpportunity.netProfit > bestOpportunity.netProfit);
                       
                       if (isBetter) {
@@ -1144,12 +1145,14 @@ export class ArbitrageStrategy implements ISwapStrategy {
       const arbitrageOpportunity = bestOpportunity;
 
       // Execute if we have an opportunity and either:
-      // 1. It's profitable and meets minimum threshold, OR
-      // 2. ALLOW_LOSS_TRADES is true (execute even at loss)
+      // 1. It's profitable (ANY profit > 0, like other bots), OR
+      // 2. ALLOW_LOSS_TRADES is true (execute even at loss), OR
       // 3. For GALA → GWETH: Use more aggressive threshold (allow small losses like other bots)
       const isGalaToGweth = arbitrageOpportunity && arbitrageOpportunity.pair === 'GALA/GWETH';
       const minProfitRequired = isGalaToGweth ? this.MIN_PROFIT_GALA_FOR_GWETH : this.MIN_PROFIT_GALA;
-      const isProfitable = arbitrageOpportunity && arbitrageOpportunity.netProfit > 0 && arbitrageOpportunity.netProfit >= minProfitRequired;
+      // Allow ANY profitable trade (other bots execute profitable trades regardless of threshold)
+      const isProfitable = arbitrageOpportunity && arbitrageOpportunity.netProfit > 0;
+      // For loss trades, only allow if they meet the special threshold
       const shouldExecuteLoss = (this.ALLOW_LOSS_TRADES || isGalaToGweth) && arbitrageOpportunity && arbitrageOpportunity.netProfit <= 0 && arbitrageOpportunity.netProfit >= minProfitRequired;
       
       if (isProfitable || shouldExecuteLoss) {
@@ -2324,7 +2327,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
         // Use market order to buy GALA with USDT
         await binanceTrading.executeTradeForArbitrage({
           symbol: 'GALAUSDT',
-          side: 'BUY',
+              side: 'BUY',
           type: 'MARKET',
           quantity: String(usdtValue), // For market buy, quantity is in quote currency (USDT)
         });
@@ -2376,24 +2379,24 @@ export class ArbitrageStrategy implements ISwapStrategy {
         }
         
         // Use market order to buy GALA with USDT
-        await binanceTrading.executeTradeForArbitrage({
+          await binanceTrading.executeTradeForArbitrage({
           symbol: 'GALAUSDT',
-          side: 'BUY',
-          type: 'MARKET',
+            side: 'BUY',
+            type: 'MARKET',
           quantity: String(usdtValue), // For market buy, quantity is in quote currency (USDT)
-        });
-        
-        logger.info(
-          {
+          });
+
+          logger.info(
+            {
             galaAmount,
             receivedGwbct,
             usdtValue: usdtValue.toFixed(2),
-            netProfit: opportunity.netProfit,
-          },
+              netProfit: opportunity.netProfit,
+            },
           '✅ GALA → GWBTC arbitrage execution complete on BOTH platforms!',
-        );
-        return;
-      }
+          );
+          return;
+        }
       
       if (receivingToken === 'GWETH') {
         // Check if this is GUSDC/GUSDT → GWETH (different logic needed)
@@ -2465,8 +2468,8 @@ export class ArbitrageStrategy implements ISwapStrategy {
         const BINANCE_MIN_NOTIONAL = 10;
         
         if (tradeValueUsdt < BINANCE_MIN_NOTIONAL) {
-          logger.warn(
-            {
+        logger.warn(
+          {
               galaAmount,
               galaPriceUsdt: galaPriceUsdt.toFixed(6),
               tradeValueUsdt: tradeValueUsdt.toFixed(2),
