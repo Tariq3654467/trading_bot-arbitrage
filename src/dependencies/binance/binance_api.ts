@@ -99,8 +99,9 @@ export class BinanceApi implements IBinanceApi {
    */
   private async syncServerTime(): Promise<void> {
     const now = Date.now();
-    // Only sync if it's been more than 5 minutes since last sync
-    if (now - this.lastTimeSync < this.TIME_SYNC_INTERVAL) {
+    // Sync more frequently to avoid timestamp errors (every 30 seconds)
+    const SYNC_INTERVAL = 30000; // 30 seconds for more accurate time sync
+    if (now - this.lastTimeSync < SYNC_INTERVAL) {
       return;
     }
 
@@ -125,16 +126,19 @@ export class BinanceApi implements IBinanceApi {
       );
     } catch (error) {
       this.logger?.warn({ error }, 'Failed to sync Binance server time, using local time');
-      // On error, use a conservative offset of -1000ms to prevent "ahead of server" errors
-      this.timeOffset = -1000;
+      // On error, use a conservative offset of -2000ms to prevent "ahead of server" errors
+      this.timeOffset = -2000;
     }
   }
 
   /**
    * Get synchronized timestamp for Binance API requests
+   * Subtracts a larger buffer (1500ms) to account for network latency, processing time, and clock drift
+   * This prevents "timestamp ahead of server" errors
    */
   private getSyncedTimestamp(): number {
-    return Date.now() + this.timeOffset;
+    const TIMESTAMP_BUFFER = 1500; // Buffer in milliseconds to account for latency and clock drift
+    return Date.now() + this.timeOffset - TIMESTAMP_BUFFER;
   }
 
   private async fetchJson(
@@ -201,6 +205,11 @@ export class BinanceApi implements IBinanceApi {
   }
 
   async getPrice(symbol: string): Promise<IBinancePrice | null> {
+    // USDT is not a valid Binance trading pair - it's always worth $1.00
+    if (symbol === 'USDT') {
+      return null; // Return null for USDT - caller should treat it as $1.00
+    }
+    
     try {
       const prices = await this.getPrices([symbol]);
       return prices.get(symbol) || null;
@@ -215,9 +224,17 @@ export class BinanceApi implements IBinanceApi {
       return new Map();
     }
 
+    // Filter out invalid symbols (USDT is not a valid trading pair - it's always $1)
+    const validSymbols = symbols.filter(s => s !== 'USDT' && s.length > 0);
+    
+    // If only USDT was requested, return empty map (USDT is always $1.00)
+    if (validSymbols.length === 0) {
+      return new Map();
+    }
+
     // Binance supports multiple symbols with comma-separated list
     // Format: /api/v3/ticker/price?symbols=["BTCUSDT","ETHUSDT"]
-    const symbolParam = symbols.map((s) => `"${s}"`).join(',');
+    const symbolParam = validSymbols.map((s) => `"${s}"`).join(',');
     const path = `/api/v3/ticker/price?symbols=[${symbolParam}]`;
 
     try {
@@ -243,8 +260,11 @@ export class BinanceApi implements IBinanceApi {
   private async getPricesFallback(symbols: readonly string[]): Promise<Map<string, IBinancePrice>> {
     const priceMap = new Map<string, IBinancePrice>();
 
+    // Filter out invalid symbols (USDT is not a valid trading pair - it's always $1)
+    const validSymbols = symbols.filter(s => s !== 'USDT' && s.length > 0);
+
     await Promise.all(
-      symbols.map(async (symbol) => {
+      validSymbols.map(async (symbol) => {
         try {
           const path = `/api/v3/ticker/price?symbol=${symbol}`;
           const result = await this.retry(() => this.fetchJson(path));
@@ -350,7 +370,9 @@ export class BinanceApi implements IBinanceApi {
       throw new Error('API key and secret are required for placing orders');
     }
 
-    const timestamp = Date.now();
+    // Sync server time before placing order to avoid timestamp errors
+    await this.syncServerTime();
+    const timestamp = this.getSyncedTimestamp();
 
     // Convert to Record for params
     const paramsRecord: Record<string, string | number | undefined> = {
@@ -405,9 +427,10 @@ export class BinanceApi implements IBinanceApi {
       throw new Error('API key and secret are required for canceling orders');
     }
 
+    await this.syncServerTime();
     const params: Record<string, string | number> = {
       symbol,
-      timestamp: Date.now(),
+      timestamp: this.getSyncedTimestamp(),
     };
 
     if (orderId !== undefined) {
@@ -510,6 +533,27 @@ export class BinanceApi implements IBinanceApi {
     return pRetry(fn, {
       retries: this.options.maxRetries ?? 5,
       onFailedAttempt: async (err: unknown) => {
+        // Handle timestamp errors specifically - force time resync and retry
+        if (err instanceof BinanceErrorResponse && err.status === 400) {
+          try {
+            const errorJson = JSON.parse(err.responseText);
+            if (errorJson.code === -1021 && errorJson.msg?.includes('timestamp')) {
+              this.logger?.warn({
+                message: 'Binance timestamp error detected - forcing time resync',
+                error: errorJson.msg,
+              });
+              // Force immediate time resync by resetting lastTimeSync
+              this.lastTimeSync = 0;
+              await this.syncServerTime();
+              // Increase buffer for next attempt
+              await sleep(500);
+              return; // Retry with new timestamp
+            }
+          } catch (parseError) {
+            // If JSON parsing fails, continue with normal retry logic
+          }
+        }
+
         this.logger?.warn({
           message: 'Binance API failed request',
           err,
@@ -518,6 +562,18 @@ export class BinanceApi implements IBinanceApi {
         await sleep(250);
       },
       shouldRetry: async (err: unknown): Promise<boolean> => {
+        // Retry timestamp errors (code -1021) - these are retriable after time sync
+        if (err instanceof BinanceErrorResponse && err.status === 400) {
+          try {
+            const errorJson = JSON.parse(err.responseText);
+            if (errorJson.code === -1021 && errorJson.msg?.includes('timestamp')) {
+              return true; // Retry timestamp errors
+            }
+          } catch (parseError) {
+            // If JSON parsing fails, continue with normal logic
+          }
+        }
+
         if (
           err instanceof BinanceErrorResponse &&
           err.status < 500 &&

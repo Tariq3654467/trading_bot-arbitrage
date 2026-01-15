@@ -36,7 +36,28 @@
         },
         "binanceSymbol": "ETHUSDT",
         "quoteCurrency": "USDT"
+      },
+      {
+        "galaToken": {
+          "collection": "GWBTC",
+          "category": "Unit",
+          "type": "none",
+          "additionalKey": "none"
+        },
+        "binanceSymbol": "BTCUSDT",
+        "quoteCurrency": "USDT"
+      },
+      {
+        "galaToken": {
+          "collection": "GSOL",
+          "category": "Unit",
+          "type": "none",
+          "additionalKey": "none"
+        },
+        "binanceSymbol": "SOLUSDT",
+        "quoteCurrency": "USDT"
       }
+
     ],
     "defaultQuoteCurrency": "USDT",
     "priceCombinationMethod": "average",

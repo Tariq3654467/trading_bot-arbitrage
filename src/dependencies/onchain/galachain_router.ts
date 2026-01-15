@@ -89,8 +89,9 @@ export class GalaChainRouter {
         'Requesting swap via gSwap SDK',
       );
 
-      // First, get a quote to find the best fee tier
-      const quote = await this.gSwap.quoting.quoteExactInput(tokenIn, tokenOut, amountIn);
+      // Force 1% fee tier (10000) for all pairs as per user requirement
+      const feeTier = 10000; // 1.00% fee tier
+      const quote = await this.gSwap.quoting.quoteExactInput(tokenIn, tokenOut, amountIn, feeTier);
 
       this.logger.info(
         {
@@ -98,9 +99,10 @@ export class GalaChainRouter {
           tokenOut,
           amountIn,
           amountOut: quote.outTokenAmount.toString(),
-          feeTier: quote.feeTier,
+          feeTier: feeTier,
+          feePercent: '1.00%',
         },
-        'Quote received from gSwap SDK',
+        'Quote received from gSwap SDK (1% fee tier)',
       );
 
       // Execute swap with 5% slippage tolerance
@@ -110,7 +112,7 @@ export class GalaChainRouter {
       const transaction = await this.gSwap.swaps.swap(
         tokenIn,
         tokenOut,
-        quote.feeTier,
+        feeTier, // Force 1% fee tier (10000) for all swaps
         {
           exactIn: amountIn,
           amountOutMinimum: amountOutMinimum,
@@ -154,30 +156,37 @@ export class GalaChainRouter {
 
   /**
    * Get price quote using gSwap SDK
+   * @param feeTier Optional fee tier (default: 10000 = 1.00%). Use 1% for all pairs as per user requirement.
    */
   async getQuote(
     tokenIn: ITokenClassKey,
     tokenOut: ITokenClassKey,
     amountIn: string,
+    feeTier?: number,
   ): Promise<IGalaChainQuote> {
     try {
       const tokenInStr = formatTokenClassKey(tokenIn);
       const tokenOutStr = formatTokenClassKey(tokenOut);
       const amountInNum = Number(amountIn);
+      // Force 1% fee tier (10000) for all pairs as per user requirement
+      const tier = feeTier ?? 10000;
 
       this.logger.info(
         {
           tokenIn: tokenInStr,
           tokenOut: tokenOutStr,
           amountIn: amountInNum,
+          feeTier: tier,
+          feePercent: '1.00%',
         },
-        'Getting quote from gSwap SDK',
+        'Getting quote from gSwap SDK (1% fee tier)',
       );
 
       const quote = await this.gSwap.quoting.quoteExactInput(
         tokenInStr,
         tokenOutStr,
         amountInNum,
+        tier,
       );
 
       this.logger.info(
@@ -425,5 +434,501 @@ export class GalaChainRouter {
    */
   getWalletAddress(): string {
     return this.walletAddress;
+  }
+
+  /**
+   * Execute direct GALA → GWETH swap with explicit 1% fee tier and success gate
+   * Based on reverse arbitrage pattern: GalaChain first, then mirror on Binance
+   * @param galaAmount Amount of GALA to swap
+   * @param slippageTolerance Slippage tolerance (default: 0.97 = 3%)
+   * @returns Transaction result with success status check
+   */
+  async executeDirectGalaToGwethSwap(
+    galaAmount: string,
+    slippageTolerance: number = 0.97,
+  ): Promise<{
+    transactionId: string;
+    status: 'pending' | 'confirmed';
+    success: boolean;
+    gwethAmount: string;
+    transaction: any; // Full transaction object for inspection
+  }> {
+    const GALA = 'GALA|Unit|none|none';
+    const GWETH = 'GWETH|Unit|none|none';
+    const FEE_TIER = 10000; // Explicitly use 1% fee tier
+
+    this.logger.info(
+      {
+        galaAmount,
+        feeTier: FEE_TIER,
+        slippageTolerance: slippageTolerance * 100 + '%',
+      },
+      'Executing direct GALA → GWETH swap with explicit 1% fee tier',
+    );
+
+    try {
+      // Step 1: Get quote
+      this.logger.info(
+        {
+          tokenIn: GALA,
+          tokenOut: GWETH,
+          amountIn: galaAmount,
+          feeTier: FEE_TIER,
+        },
+        'Getting quote for GALA → GWETH',
+      );
+
+      const quote = await this.gSwap.quoting.quoteExactInput(GALA, GWETH, Number(galaAmount), FEE_TIER);
+
+      this.logger.info(
+        {
+          amountIn: galaAmount,
+          amountOut: quote.outTokenAmount.toString(),
+          feeTier: quote.feeTier,
+        },
+        'Quote received for GALA → GWETH',
+      );
+
+      // Step 2: Execute swap
+      this.logger.info(
+        {
+          amountIn: galaAmount,
+          amountOutMinimum: quote.outTokenAmount.multipliedBy(slippageTolerance).toString(),
+        },
+        'Sending swap to GalaChain...',
+      );
+
+      const transaction = await this.gSwap.swaps.swap(
+        GALA,
+        GWETH,
+        FEE_TIER,
+        {
+          exactIn: Number(galaAmount),
+          amountOutMinimum: quote.outTokenAmount.multipliedBy(slippageTolerance),
+        },
+        this.walletAddress,
+      );
+
+      // Step 3: Success gate - check transaction status
+      // Check Status 1 (Success) or the presence of a transactionId
+      const isSuccess =
+        (transaction as any).Status === 1 ||
+        (transaction as any).Data?.transactionId ||
+        transaction.transactionId;
+
+      const txId = transaction.transactionId || (transaction as any).Data?.transactionId || 'pending';
+
+      if (isSuccess) {
+        this.logger.info(
+          {
+            transactionId: txId,
+            status: 'success',
+            gwethAmount: quote.outTokenAmount.toString(),
+          },
+          '✅ GalaSwap SUCCESS - Transaction confirmed',
+        );
+      } else {
+        this.logger.warn(
+          {
+            transactionId: txId,
+            message: (transaction as any).Message || (transaction as any).message || 'Unknown error',
+          },
+          '⚠️ GalaSwap transaction status unclear',
+        );
+      }
+
+      return {
+        transactionId: txId,
+        status: isSuccess ? 'confirmed' : 'pending',
+        success: !!isSuccess,
+        gwethAmount: quote.outTokenAmount.toString(),
+        transaction, // Return full transaction for inspection
+      };
+    } catch (error: any) {
+      this.logger.error(
+        {
+          error: error?.message || error?.toString() || error,
+          galaAmount,
+        },
+        'Failed to execute direct GALA → GWETH swap',
+      );
+      throw error;
+    }
+  }
+
+  /**
+   * Execute direct GWETH → GALA swap with explicit 1% fee tier and success gate
+   * Based on reverse arbitrage pattern: GalaChain first, then mirror on Binance
+   * @param gwethAmount Amount of GWETH to swap
+   * @param slippageTolerance Slippage tolerance (default: 0.95 = 5%)
+   * @returns Transaction result with success status check
+   */
+  async executeDirectGwethToGalaSwap(
+    gwethAmount: string,
+    slippageTolerance: number = 0.95,
+  ): Promise<{
+    transactionId: string;
+    status: 'pending' | 'confirmed';
+    success: boolean;
+    galaAmount: string;
+    transaction: any; // Full transaction object for inspection
+  }> {
+    const GWETH = 'GWETH|Unit|none|none';
+    const GALA = 'GALA|Unit|none|none';
+    const FEE_TIER = 10000; // Explicitly use 1% fee tier
+
+    this.logger.info(
+      {
+        gwethAmount,
+        feeTier: FEE_TIER,
+        slippageTolerance: slippageTolerance * 100 + '%',
+      },
+      'Executing direct GWETH → GALA swap with explicit 1% fee tier',
+    );
+
+    try {
+      // Step 1: Get quote
+      this.logger.info(
+        {
+          tokenIn: GWETH,
+          tokenOut: GALA,
+          amountIn: gwethAmount,
+          feeTier: FEE_TIER,
+        },
+        'Getting quote for GWETH → GALA',
+      );
+
+      const quote = await this.gSwap.quoting.quoteExactInput(GWETH, GALA, Number(gwethAmount), FEE_TIER);
+
+      this.logger.info(
+        {
+          amountIn: gwethAmount,
+          amountOut: quote.outTokenAmount.toString(),
+          feeTier: quote.feeTier,
+        },
+        'Quote received for GWETH → GALA',
+      );
+
+      // Step 2: Execute swap
+      this.logger.info(
+        {
+          amountIn: gwethAmount,
+          amountOutMinimum: quote.outTokenAmount.multipliedBy(slippageTolerance).toString(),
+        },
+        'Executing GalaSwap trade...',
+      );
+
+      const transaction = await this.gSwap.swaps.swap(
+        GWETH,
+        GALA,
+        quote.feeTier, // Use fee tier from quote
+        {
+          exactIn: Number(gwethAmount),
+          amountOutMinimum: quote.outTokenAmount.multipliedBy(slippageTolerance),
+        },
+        this.walletAddress,
+      );
+
+      // Step 3: Success gate - check transaction status
+      // Check Status 1 (Success) or the absence of error
+      const isSuccess =
+        (transaction as any).Status === 1 ||
+        !(transaction as any).error ||
+        (transaction as any).Data?.transactionId ||
+        transaction.transactionId;
+
+      const txId = transaction.transactionId || (transaction as any).Data?.transactionId || 'pending';
+      const receivedGala = quote.outTokenAmount.toString();
+
+      if (isSuccess) {
+        this.logger.info(
+          {
+            transactionId: txId,
+            status: 'success',
+            galaAmount: receivedGala,
+          },
+          '✨ GalaSwap Success! Received GALA',
+        );
+      } else {
+        this.logger.error(
+          {
+            transactionId: txId,
+            message: (transaction as any).Message || (transaction as any).message || 'Unknown error',
+          },
+          '❌ GalaSwap Transaction Failed',
+        );
+      }
+
+      return {
+        transactionId: txId,
+        status: isSuccess ? 'confirmed' : 'pending',
+        success: !!isSuccess,
+        galaAmount: receivedGala,
+        transaction, // Return full transaction for inspection
+      };
+    } catch (error: any) {
+      this.logger.error(
+        {
+          error: error?.message || error?.toString() || error,
+          gwethAmount,
+        },
+        '❌ Error in Sequence: Failed to execute direct GWETH → GALA swap',
+      );
+      throw error;
+    }
+  }
+
+  /**
+   * Execute direct GALA → GWBTC swap
+   * @param galaAmount - Amount of GALA to swap
+   * @param slippageTolerance - Slippage tolerance (0.95 = 5% slippage, 0.97 = 3% slippage)
+   * @returns Swap result with transaction ID and received GWBTC amount
+   */
+  async executeDirectGalaToGwbctSwap(
+    galaAmount: string,
+    slippageTolerance: number = 0.95,
+  ): Promise<{
+    transactionId: string;
+    status: 'pending' | 'confirmed';
+    success: boolean;
+    gwbctAmount: string;
+    transaction: any;
+  }> {
+    const GALA = 'GALA|Unit|none|none';
+    const GWBTC = 'GWBTC|Unit|none|none';
+    const FEE_TIER = 10000; // 1% fee tier
+
+    this.logger.info(
+      {
+        galaAmount,
+        feeTier: FEE_TIER,
+        slippageTolerance: `${(slippageTolerance * 100).toFixed(0)}%`,
+      },
+      'Executing direct GALA → GWBTC swap with explicit 1% fee tier',
+    );
+
+    try {
+      // Step 1: Get quote
+      this.logger.info(
+        {
+          tokenIn: GALA,
+          tokenOut: GWBTC,
+          amountIn: galaAmount,
+          feeTier: FEE_TIER,
+        },
+        'Getting quote for GALA → GWBTC',
+      );
+
+      const quote = await this.gSwap.quoting.quoteExactInput(GALA, GWBTC, Number(galaAmount), FEE_TIER);
+
+      this.logger.info(
+        {
+          amountIn: galaAmount,
+          amountOut: quote.outTokenAmount.toString(),
+          feeTier: quote.feeTier,
+        },
+        'Quote received for GALA → GWBTC',
+      );
+
+      // Step 2: Execute swap
+      this.logger.info(
+        {
+          amountIn: galaAmount,
+          amountOutMinimum: quote.outTokenAmount.multipliedBy(slippageTolerance).toString(),
+        },
+        'Sending swap to GalaChain...',
+      );
+
+      const transaction = await this.gSwap.swaps.swap(
+        GALA,
+        GWBTC,
+        FEE_TIER,
+        {
+          exactIn: Number(galaAmount),
+          amountOutMinimum: quote.outTokenAmount.multipliedBy(slippageTolerance),
+        },
+        this.walletAddress,
+      );
+
+      // Step 3: Success gate - check transaction status
+      const isSuccess =
+        (transaction as any).Status === 1 ||
+        (transaction as any).Data?.transactionId ||
+        transaction.transactionId;
+
+      const txId = transaction.transactionId || (transaction as any).Data?.transactionId || 'pending';
+
+      if (isSuccess) {
+        this.logger.info(
+          {
+            transactionId: txId,
+            status: 'success',
+            gwbctAmount: quote.outTokenAmount.toString(),
+          },
+          '✅ GalaSwap SUCCESS - Transaction confirmed',
+        );
+
+        return {
+          transactionId: txId,
+          status: 'confirmed',
+          success: true,
+          gwbctAmount: quote.outTokenAmount.toString(),
+          transaction,
+        };
+      } else {
+        this.logger.error(
+          {
+            transactionId: txId,
+            status: (transaction as any).Status,
+            message: (transaction as any).Message || (transaction as any).message,
+          },
+          '❌ GalaSwap FAILED - Transaction not confirmed',
+        );
+
+        return {
+          transactionId: txId,
+          status: 'pending',
+          success: false,
+          gwbctAmount: '0',
+          transaction,
+        };
+      }
+    } catch (error: any) {
+      this.logger.error(
+        {
+          error: error?.message || error?.toString() || error,
+          galaAmount,
+        },
+        '❌ Error executing GALA → GWBTC swap',
+      );
+      throw error;
+    }
+  }
+
+  /**
+   * Execute direct GALA → GSOL swap
+   * @param galaAmount - Amount of GALA to swap
+   * @param slippageTolerance - Slippage tolerance (0.95 = 5% slippage, 0.97 = 3% slippage)
+   * @returns Swap result with transaction ID and received GSOL amount
+   */
+  async executeDirectGalaToGsolSwap(
+    galaAmount: string,
+    slippageTolerance: number = 0.95,
+  ): Promise<{
+    transactionId: string;
+    status: 'pending' | 'confirmed';
+    success: boolean;
+    gsolAmount: string;
+    transaction: any;
+  }> {
+    const GALA = 'GALA|Unit|none|none';
+    const GSOL = 'GSOL|Unit|none|none';
+    const FEE_TIER = 10000; // 1% fee tier
+
+    this.logger.info(
+      {
+        galaAmount,
+        feeTier: FEE_TIER,
+        slippageTolerance: `${(slippageTolerance * 100).toFixed(0)}%`,
+      },
+      'Executing direct GALA → GSOL swap with explicit 1% fee tier',
+    );
+
+    try {
+      // Step 1: Get quote
+      this.logger.info(
+        {
+          tokenIn: GALA,
+          tokenOut: GSOL,
+          amountIn: galaAmount,
+          feeTier: FEE_TIER,
+        },
+        'Getting quote for GALA → GSOL',
+      );
+
+      const quote = await this.gSwap.quoting.quoteExactInput(GALA, GSOL, Number(galaAmount), FEE_TIER);
+
+      this.logger.info(
+        {
+          amountIn: galaAmount,
+          amountOut: quote.outTokenAmount.toString(),
+          feeTier: quote.feeTier,
+        },
+        'Quote received for GALA → GSOL',
+      );
+
+      // Step 2: Execute swap
+      this.logger.info(
+        {
+          amountIn: galaAmount,
+          amountOutMinimum: quote.outTokenAmount.multipliedBy(slippageTolerance).toString(),
+        },
+        'Sending swap to GalaChain...',
+      );
+
+      const transaction = await this.gSwap.swaps.swap(
+        GALA,
+        GSOL,
+        FEE_TIER,
+        {
+          exactIn: Number(galaAmount),
+          amountOutMinimum: quote.outTokenAmount.multipliedBy(slippageTolerance),
+        },
+        this.walletAddress,
+      );
+
+      // Step 3: Success gate - check transaction status
+      const isSuccess =
+        (transaction as any).Status === 1 ||
+        (transaction as any).Data?.transactionId ||
+        transaction.transactionId;
+
+      const txId = transaction.transactionId || (transaction as any).Data?.transactionId || 'pending';
+
+      if (isSuccess) {
+        this.logger.info(
+          {
+            transactionId: txId,
+            status: 'success',
+            gsolAmount: quote.outTokenAmount.toString(),
+          },
+          '✅ GalaSwap SUCCESS - Transaction confirmed',
+        );
+
+        return {
+          transactionId: txId,
+          status: 'confirmed',
+          success: true,
+          gsolAmount: quote.outTokenAmount.toString(),
+          transaction,
+        };
+      } else {
+        this.logger.error(
+          {
+            transactionId: txId,
+            status: (transaction as any).Status,
+            message: (transaction as any).Message || (transaction as any).message,
+          },
+          '❌ GalaSwap FAILED - Transaction not confirmed',
+        );
+
+        return {
+          transactionId: txId,
+          status: 'pending',
+          success: false,
+          gsolAmount: '0',
+          transaction,
+        };
+      }
+    } catch (error: any) {
+      this.logger.error(
+        {
+          error: error?.message || error?.toString() || error,
+          galaAmount,
+        },
+        '❌ Error executing GALA → GSOL swap',
+      );
+      throw error;
+    }
   }
 }
