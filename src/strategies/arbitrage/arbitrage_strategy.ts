@@ -271,21 +271,6 @@ export class ArbitrageStrategy implements ISwapStrategy {
         token: string;
       }> = [];
 
-      // Collect all opportunity checks to run in parallel
-      type OpportunityCheck = {
-        tokenName: string;
-        tradeSize: number;
-        galaToken: string;
-        receivingToken: string;
-        binanceSymbol: string;
-        quoteCurrency: string;
-        direction: 'GalaSwap->Binance' | 'Binance->GalaSwap';
-        tokenInfo: typeof filteredArbitrageableTokens[0];
-      };
-
-      const opportunityChecks: OpportunityCheck[] = [];
-      const now = Date.now();
-
       // Check arbitrage opportunities for each token that has a Binance mapping
       // ✅ All tokens with Binance mappings are processed (GALA, GWETH, GWBTC, GSOL, GUSDC, GUSDT, and others)
       // All pairs use 1% fee tier (10000) as per user requirement
@@ -372,6 +357,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
         );
 
         // Check if we should skip GWETH due to recent failures (circuit breaker)
+        const now = Date.now();
         const shouldSkipGweth = tokenName === 'GALA' && 
                                 this.gwethFailureCount >= this.GWETH_MAX_FAILURES && 
                                 (now - this.gwethLastFailureTime) < this.GWETH_RETRY_INTERVAL;
@@ -388,7 +374,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
           );
         }
 
-        // Collect all opportunity checks for this token to run in parallel
+        // Try each trade size to find the most profitable opportunity for this token
         for (const tradeSize of validSizes) {
           logger.info(
             {
@@ -399,143 +385,75 @@ export class ArbitrageStrategy implements ISwapStrategy {
             `Arbitrage: Checking ${tokenName} opportunity with trade size`,
           );
 
-          let arbitrageOpportunity: ReturnType<typeof this.checkArbitrageOpportunity> extends Promise<infer T> ? T : null = null;
+          // Collect all opportunity checks for this token/tradeSize to run in parallel
+          type CheckTask = {
+            promise: Promise<ReturnType<typeof this.checkArbitrageOpportunity> | null>;
+            pair: string;
+            description: string;
+          };
           
-          // For GALA, try GWETH first, then stablecoins
+          const checksToRun: CheckTask[] = [];
+          
+          // For GALA, collect all pairs to check in parallel
           if (tokenName === 'GALA') {
             // Try GALA/GWETH first (primary pair) - but only if circuit breaker is not active
             if (!shouldSkipGweth) {
-              arbitrageOpportunity = await this.checkArbitrageOpportunity(
-                logger,
-                options.binanceApi,
-                options.galaChainRouter,
-                tradeSize,
-                'GALA',
-                'GWETH',
-                'GALAETH',
-                'ETHUSDT',
-              );
-
-              // Handle GWETH circuit breaker
-              if (!arbitrageOpportunity) {
-                this.gwethFailureCount++;
-                this.gwethLastFailureTime = now;
-                if (this.gwethFailureCount >= this.GWETH_MAX_FAILURES) {
-                  logger.warn(
-                    {
-                      failureCount: this.gwethFailureCount,
-                      maxFailures: this.GWETH_MAX_FAILURES,
-                      retryAfter: new Date(now + this.GWETH_RETRY_INTERVAL).toISOString(),
-                      note: 'GWETH pool has insufficient liquidity. Will skip GWETH checks for 5 minutes.',
-                    },
-                    'GWETH circuit breaker activated - skipping GWETH checks',
-                  );
-                } else {
-                  logger.info(
-                    {
-                      failureCount: this.gwethFailureCount,
-                      maxFailures: this.GWETH_MAX_FAILURES,
-                      tradeSize,
-                    },
-                    'Arbitrage: GWETH check failed (liquidity issue)',
-                  );
-                }
-              } else {
-                if (this.gwethFailureCount > 0) {
-                  logger.info(
-                    {
-                      previousFailures: this.gwethFailureCount,
-                      note: 'GWETH pool now has liquidity - resetting failure counter',
-                    },
-                    'GWETH arbitrage check succeeded (circuit breaker reset)',
-                  );
-                }
-                this.gwethFailureCount = 0;
-              }
-            }
-
-            // If GALA/GWETH failed, try GALA → GSOL (minimum 1500 GALA)
-            if (!arbitrageOpportunity && tradeSize >= this.MIN_GALA_FOR_GSOL) {
-              logger.info(
-                {
-                  pair: 'GALA/GSOL',
+              checksToRun.push({
+                promise: this.checkArbitrageOpportunity(
+                  logger,
+                  options.binanceApi,
+                  options.galaChainRouter,
                   tradeSize,
-                  note: 'Checking GALA → GSOL (minimum 1500 GALA required)',
-                },
-                'Arbitrage: Checking GALA → GSOL opportunity',
-              );
-              
-              arbitrageOpportunity = await this.checkArbitrageOpportunity(
-                logger,
-                options.binanceApi,
-                options.galaChainRouter,
-                tradeSize,
-                'GALA',
-                'GSOL',
-                'GALAUSDT',
-                'SOLUSDT',
-              );
-              
-              if (arbitrageOpportunity) {
-                logger.info(
-                  {
-                    pair: 'GALA/GSOL',
-                    netProfit: arbitrageOpportunity.netProfit.toFixed(4),
-                    tradeSize,
-                    isProfitable: arbitrageOpportunity.netProfit > 0,
-                  },
-                  `Arbitrage: Found GALA → GSOL opportunity`,
-                );
-              }
+                  'GALA',
+                  'GWETH',
+                  'GALAETH',
+                  'ETHUSDT',
+                ),
+                pair: 'GALA/GWETH',
+                description: 'GALA → GWETH',
+              });
             }
 
-            // If still no opportunity, try GALA → GWBTC (minimum 1500 GALA)
-            if (!arbitrageOpportunity && tradeSize >= this.MIN_GALA_FOR_GWBTC) {
-              logger.info(
-                {
-                  pair: 'GALA/GWBTC',
+            // GALA → GSOL (minimum 1500 GALA)
+            if (tradeSize >= this.MIN_GALA_FOR_GSOL) {
+              checksToRun.push({
+                promise: this.checkArbitrageOpportunity(
+                  logger,
+                  options.binanceApi,
+                  options.galaChainRouter,
                   tradeSize,
-                  note: 'Checking GALA → GWBTC (minimum 1500 GALA required)',
-                },
-                'Arbitrage: Checking GALA → GWBTC opportunity',
-              );
-              
-              arbitrageOpportunity = await this.checkArbitrageOpportunity(
-                logger,
-                options.binanceApi,
-                options.galaChainRouter,
-                tradeSize,
-                'GALA',
-                'GWBTC',
-                'GALAUSDT',
-                'BTCUSDT',
-              );
-              
-              if (arbitrageOpportunity) {
-                logger.info(
-                  {
-                    pair: 'GALA/GWBTC',
-                    netProfit: arbitrageOpportunity.netProfit.toFixed(4),
-                    tradeSize,
-                    isProfitable: arbitrageOpportunity.netProfit > 0,
-                  },
-                  `Arbitrage: Found GALA → GWBTC opportunity`,
-                );
-              }
+                  'GALA',
+                  'GSOL',
+                  'GALAUSDT',
+                  'SOLUSDT',
+                ),
+                pair: 'GALA/GSOL',
+                description: 'GALA → GSOL',
+              });
             }
 
-            // If still no opportunity, try stablecoin pairs
-            if (!arbitrageOpportunity) {
-              for (const pair of this.ALTERNATIVE_PAIRS) {
-                logger.info(
-                  {
-                    pair: pair.description,
-                    tradeSize,
-                  },
-                  'Arbitrage: Checking alternative pair',
-                );
-                
-                arbitrageOpportunity = await this.checkArbitrageOpportunity(
+            // GALA → GWBTC (minimum 1500 GALA)
+            if (tradeSize >= this.MIN_GALA_FOR_GWBTC) {
+              checksToRun.push({
+                promise: this.checkArbitrageOpportunity(
+                  logger,
+                  options.binanceApi,
+                  options.galaChainRouter,
+                  tradeSize,
+                  'GALA',
+                  'GWBTC',
+                  'GALAUSDT',
+                  'BTCUSDT',
+                ),
+                pair: 'GALA/GWBTC',
+                description: 'GALA → GWBTC',
+              });
+            }
+
+            // Alternative stablecoin pairs
+            for (const pair of this.ALTERNATIVE_PAIRS) {
+              checksToRun.push({
+                promise: this.checkArbitrageOpportunity(
                   logger,
                   options.binanceApi,
                   options.galaChainRouter,
@@ -544,148 +462,134 @@ export class ArbitrageStrategy implements ISwapStrategy {
                   pair.receivingToken,
                   pair.binanceSymbol,
                   'USDT',
-                );
+                ),
+                pair: pair.description,
+                description: pair.description,
+              });
+            }
+            
+            // Run all checks in parallel
+            logger.info(
+              {
+                token: tokenName,
+                tradeSize,
+                totalChecks: checksToRun.length,
+                pairs: checksToRun.map(c => c.pair),
+              },
+              `Arbitrage: Running ${checksToRun.length} parallel checks for ${tokenName}`,
+            );
+            
+            const results = await Promise.allSettled(checksToRun.map(check => check.promise));
+            
+            // Process all results to find the best opportunity
+            let arbitrageOpportunity: ReturnType<typeof this.checkArbitrageOpportunity> extends Promise<infer T> ? T : null = null;
+            let gwethCheckFailed = false;
+            
+            for (let i = 0; i < results.length; i++) {
+              const result = results[i];
+              const check = checksToRun[i];
+              
+              if (result.status === 'fulfilled' && result.value) {
+                const opportunity = result.value;
                 
-                if (arbitrageOpportunity) {
+                // Handle GWETH circuit breaker
+                if (check.pair === 'GALA/GWETH') {
+                  if (!opportunity) {
+                    gwethCheckFailed = true;
+                    this.gwethFailureCount++;
+                    this.gwethLastFailureTime = now;
+                    if (this.gwethFailureCount >= this.GWETH_MAX_FAILURES) {
+                      logger.warn(
+                        {
+                          failureCount: this.gwethFailureCount,
+                          maxFailures: this.GWETH_MAX_FAILURES,
+                          retryAfter: new Date(now + this.GWETH_RETRY_INTERVAL).toISOString(),
+                          note: 'GWETH pool has insufficient liquidity. Will skip GWETH checks for 5 minutes.',
+                        },
+                        'GWETH circuit breaker activated - skipping GWETH checks',
+                      );
+                    } else {
+                      logger.info(
+                        {
+                          failureCount: this.gwethFailureCount,
+                          maxFailures: this.GWETH_MAX_FAILURES,
+                          tradeSize,
+                        },
+                        'Arbitrage: GWETH check failed (liquidity issue)',
+                      );
+                    }
+                  } else {
+                    if (this.gwethFailureCount > 0) {
+                      logger.info(
+                        {
+                          previousFailures: this.gwethFailureCount,
+                          note: 'GWETH pool now has liquidity - resetting failure counter',
+                        },
+                        'GWETH arbitrage check succeeded (circuit breaker reset)',
+                      );
+                    }
+                    this.gwethFailureCount = 0;
+                  }
+                }
+                
+                // Track this opportunity
+                if (opportunity) {
                   logger.info(
                     {
-                      pair: pair.description,
-                      netProfit: arbitrageOpportunity.netProfit.toFixed(4),
+                      pair: check.pair,
+                      netProfit: opportunity.netProfit.toFixed(4),
                       tradeSize,
-                      isProfitable: arbitrageOpportunity.netProfit > 0,
+                      isProfitable: opportunity.netProfit > 0,
                     },
-                    'Arbitrage: Found opportunity with alternative pair',
+                    `Arbitrage: Found ${check.description} opportunity`,
                   );
-                  // Continue checking other pairs for this trade size to find the best opportunity
+                  
+                  // Select the best opportunity (most profitable)
+                  if (!arbitrageOpportunity || 
+                      (opportunity.netProfit > 0 && (!arbitrageOpportunity.netProfit || arbitrageOpportunity.netProfit <= 0 || opportunity.netProfit > arbitrageOpportunity.netProfit)) ||
+                      (opportunity.netProfit <= 0 && arbitrageOpportunity.netProfit <= 0 && opportunity.netProfit > arbitrageOpportunity.netProfit)) {
+                    arbitrageOpportunity = opportunity;
+                  }
+                }
+              } else if (result.status === 'rejected') {
+                logger.warn(
+                  {
+                    pair: check.pair,
+                    error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+                  },
+                  `Arbitrage: Check failed for ${check.description}`,
+                );
+                
+                // Handle GWETH circuit breaker for rejected promises
+                if (check.pair === 'GALA/GWETH') {
+                  gwethCheckFailed = true;
+                  this.gwethFailureCount++;
+                  this.gwethLastFailureTime = now;
                 }
               }
             }
           } else if (tokenName === 'GWETH') {
-            // For GWETH, try direct GWETH → GALA swap first (like user's script)
-            logger.info(
-              {
-                token: tokenName,
-                tradeSize,
-                pair: 'GWETH/GALA',
-              },
-              `Arbitrage: Checking GWETH → GALA direct swap opportunity`,
-            );
-            
-            // Check arbitrage: Sell GWETH on GalaSwap for GALA, then mirror on Binance
-            // For GWETH → GALA: We need ETHUSDT price (GWETH maps to ETH on Binance)
-            arbitrageOpportunity = await this.checkArbitrageOpportunity(
-              logger,
-              options.binanceApi,
-              options.galaChainRouter,
-              tradeSize,
-              'GWETH',
-              'GALA',
-              'GALAUSDT', // Will use GALA → USDT → ETH path on Binance
-              'ETHUSDT', // Use ETHUSDT for GWETH price (not USDT)
-            );
-            
-            if (arbitrageOpportunity) {
-              logger.info(
-                {
-                  token: tokenName,
-                  pair: 'GWETH/GALA',
-                  netProfit: arbitrageOpportunity.netProfit.toFixed(4),
-                  tradeSize,
-                  isProfitable: arbitrageOpportunity.netProfit > 0,
-                },
-                `Arbitrage: Found GWETH → GALA opportunity`,
-              );
-            } else {
-              // Fallback: Try GWETH → GUSDC/GUSDT if direct swap doesn't work
-            const receivingTokens = ['GUSDC', 'GUSDT'];
-            
-            for (const receivingToken of receivingTokens) {
-              logger.info(
-                {
-                  token: tokenName,
-                  receivingToken,
-                  tradeSize,
-                  binanceSymbol: tokenInfo.binanceSymbol,
-                },
-                `Arbitrage: Checking ${tokenName}/${receivingToken} -> ${tokenInfo.binanceSymbol}`,
-              );
-              
-              arbitrageOpportunity = await this.checkArbitrageOpportunity(
+            // For GWETH, collect all pairs to check in parallel
+            checksToRun.push({
+              promise: this.checkArbitrageOpportunity(
                 logger,
                 options.binanceApi,
                 options.galaChainRouter,
                 tradeSize,
-                tokenName,
-                receivingToken,
-                tokenInfo.binanceSymbol,
-                'USDT',
-              );
-              
-              if (arbitrageOpportunity) {
-                logger.info(
-                  {
-                    token: tokenName,
-                    pair: `${tokenName}/${receivingToken} -> ${tokenInfo.binanceSymbol}`,
-                    netProfit: arbitrageOpportunity.netProfit.toFixed(4),
-                    tradeSize,
-                    isProfitable: arbitrageOpportunity.netProfit > 0,
-                  },
-                  `Arbitrage: Found opportunity for ${tokenName}`,
-                );
-                // Continue checking other pairs for this trade size to find the best opportunity
-              }
-            }
-            }
-          } else if (tokenName === 'GWBTC') {
-            // For GWBTC, try direct GWBTC → GALA swap first
-            logger.info(
-              {
-                token: tokenName,
-                tradeSize,
-                pair: 'GWBTC/GALA',
-              },
-              `Arbitrage: Checking GWBTC → GALA direct swap opportunity`,
-            );
+                'GWETH',
+                'GALA',
+                'GALAUSDT', // Will use GALA → USDT → ETH path on Binance
+                'ETHUSDT', // Use ETHUSDT for GWETH price (not USDT)
+              ),
+              pair: 'GWETH/GALA',
+              description: 'GWETH → GALA',
+            });
             
-            // Check arbitrage: Sell GWBTC on GalaSwap for GALA, then mirror on Binance
-            arbitrageOpportunity = await this.checkArbitrageOpportunity(
-              logger,
-              options.binanceApi,
-              options.galaChainRouter,
-              tradeSize,
-              'GWBTC',
-              'GALA',
-              'GALAUSDT', // Will use GALA → USDT → BTC path on Binance
-              'BTCUSDT', // Use BTCUSDT to get BTC price for comparison
-            );
-            
-            if (arbitrageOpportunity) {
-              logger.info(
-                {
-                  token: tokenName,
-                  pair: 'GWBTC/GALA',
-                  netProfit: arbitrageOpportunity.netProfit.toFixed(4),
-                  tradeSize,
-                  isProfitable: arbitrageOpportunity.netProfit > 0,
-                },
-                `Arbitrage: Found GWBTC → GALA opportunity`,
-              );
-          } else {
-              // Fallback: Try GWBTC → GUSDC/GUSDT if direct swap doesn't work
-              const receivingTokens = ['GUSDC', 'GUSDT'];
-              
-              for (const receivingToken of receivingTokens) {
-                logger.info(
-              {
-                token: tokenName,
-                    receivingToken,
-                    tradeSize,
-                    binanceSymbol: tokenInfo.binanceSymbol,
-                  },
-                  `Arbitrage: Checking ${tokenName}/${receivingToken} -> ${tokenInfo.binanceSymbol}`,
-                );
-                
-                arbitrageOpportunity = await this.checkArbitrageOpportunity(
+            // Fallback: Try GWETH → GUSDC/GUSDT
+            const receivingTokens = ['GUSDC', 'GUSDT'];
+            for (const receivingToken of receivingTokens) {
+              checksToRun.push({
+                promise: this.checkArbitrageOpportunity(
                   logger,
                   options.binanceApi,
                   options.galaChainRouter,
@@ -694,21 +598,146 @@ export class ArbitrageStrategy implements ISwapStrategy {
                   receivingToken,
                   tokenInfo.binanceSymbol,
                   'USDT',
-                );
-                
-                if (arbitrageOpportunity) {
+                ),
+                pair: `${tokenName}/${receivingToken}`,
+                description: `${tokenName} → ${receivingToken}`,
+              });
+            }
+            
+            // Run all checks in parallel
+            logger.info(
+              {
+                token: tokenName,
+                tradeSize,
+                totalChecks: checksToRun.length,
+                pairs: checksToRun.map(c => c.pair),
+              },
+              `Arbitrage: Running ${checksToRun.length} parallel checks for ${tokenName}`,
+            );
+            
+            const results = await Promise.allSettled(checksToRun.map(check => check.promise));
+            
+            // Process all results to find the best opportunity
+            let arbitrageOpportunity: ReturnType<typeof this.checkArbitrageOpportunity> extends Promise<infer T> ? T : null = null;
+            
+            for (let i = 0; i < results.length; i++) {
+              const result = results[i];
+              const check = checksToRun[i];
+              
+              if (result.status === 'fulfilled' && result.value) {
+                const opportunity = result.value;
+                if (opportunity) {
                   logger.info(
                     {
-                      token: tokenName,
-                      pair: `${tokenName}/${receivingToken} -> ${tokenInfo.binanceSymbol}`,
-                      netProfit: arbitrageOpportunity.netProfit.toFixed(4),
+                      pair: check.pair,
+                      netProfit: opportunity.netProfit.toFixed(4),
                       tradeSize,
-                      isProfitable: arbitrageOpportunity.netProfit > 0,
+                      isProfitable: opportunity.netProfit > 0,
                     },
-                    `Arbitrage: Found opportunity for ${tokenName}`,
+                    `Arbitrage: Found ${check.description} opportunity`,
                   );
-                  // Continue checking other pairs for this trade size to find the best opportunity
+                  
+                  // Select the best opportunity (most profitable)
+                  if (!arbitrageOpportunity || 
+                      (opportunity.netProfit > 0 && (!arbitrageOpportunity.netProfit || arbitrageOpportunity.netProfit <= 0 || opportunity.netProfit > arbitrageOpportunity.netProfit)) ||
+                      (opportunity.netProfit <= 0 && arbitrageOpportunity.netProfit <= 0 && opportunity.netProfit > arbitrageOpportunity.netProfit)) {
+                    arbitrageOpportunity = opportunity;
+                  }
                 }
+              } else if (result.status === 'rejected') {
+                logger.warn(
+                  {
+                    pair: check.pair,
+                    error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+                  },
+                  `Arbitrage: Check failed for ${check.description}`,
+                );
+              }
+            }
+          } else if (tokenName === 'GWBTC') {
+            // For GWBTC, collect all pairs to check in parallel
+            checksToRun.push({
+              promise: this.checkArbitrageOpportunity(
+                logger,
+                options.binanceApi,
+                options.galaChainRouter,
+                tradeSize,
+                'GWBTC',
+                'GALA',
+                'GALAUSDT', // Will use GALA → USDT → BTC path on Binance
+                'BTCUSDT', // Use BTCUSDT to get BTC price for comparison
+              ),
+              pair: 'GWBTC/GALA',
+              description: 'GWBTC → GALA',
+            });
+            
+            // Fallback: Try GWBTC → GUSDC/GUSDT
+            const receivingTokens = ['GUSDC', 'GUSDT'];
+            for (const receivingToken of receivingTokens) {
+              checksToRun.push({
+                promise: this.checkArbitrageOpportunity(
+                  logger,
+                  options.binanceApi,
+                  options.galaChainRouter,
+                  tradeSize,
+                  tokenName,
+                  receivingToken,
+                  tokenInfo.binanceSymbol,
+                  'USDT',
+                ),
+                pair: `${tokenName}/${receivingToken}`,
+                description: `${tokenName} → ${receivingToken}`,
+              });
+            }
+            
+            // Run all checks in parallel
+            logger.info(
+              {
+                token: tokenName,
+                tradeSize,
+                totalChecks: checksToRun.length,
+                pairs: checksToRun.map(c => c.pair),
+              },
+              `Arbitrage: Running ${checksToRun.length} parallel checks for ${tokenName}`,
+            );
+            
+            const results = await Promise.allSettled(checksToRun.map(check => check.promise));
+            
+            // Process all results to find the best opportunity
+            let arbitrageOpportunity: ReturnType<typeof this.checkArbitrageOpportunity> extends Promise<infer T> ? T : null = null;
+            
+            for (let i = 0; i < results.length; i++) {
+              const result = results[i];
+              const check = checksToRun[i];
+              
+              if (result.status === 'fulfilled' && result.value) {
+                const opportunity = result.value;
+                if (opportunity) {
+                  logger.info(
+                    {
+                      pair: check.pair,
+                      netProfit: opportunity.netProfit.toFixed(4),
+                      tradeSize,
+                      isProfitable: opportunity.netProfit > 0,
+                    },
+                    `Arbitrage: Found ${check.description} opportunity`,
+                  );
+                  
+                  // Select the best opportunity (most profitable)
+                  if (!arbitrageOpportunity || 
+                      (opportunity.netProfit > 0 && (!arbitrageOpportunity.netProfit || arbitrageOpportunity.netProfit <= 0 || opportunity.netProfit > arbitrageOpportunity.netProfit)) ||
+                      (opportunity.netProfit <= 0 && arbitrageOpportunity.netProfit <= 0 && opportunity.netProfit > arbitrageOpportunity.netProfit)) {
+                    arbitrageOpportunity = opportunity;
+                  }
+                }
+              } else if (result.status === 'rejected') {
+                logger.warn(
+                  {
+                    pair: check.pair,
+                    error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+                  },
+                  `Arbitrage: Check failed for ${check.description}`,
+                );
               }
             }
           } else if (tokenName === 'GSOL') {
