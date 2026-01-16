@@ -1049,6 +1049,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
 
         // Check reverse direction: Binance -> GalaSwap (for tokens that have Binance equivalents)
         // This requires USDT balance on Binance
+        // Note: Reverse arbitrage can be checked even if we don't have the token balance on GalaSwap
         if (tokenName !== 'GUSDC' && tokenName !== 'GUSDT') {
           try {
             const binanceBalances = await options.binanceApi.getBalances();
