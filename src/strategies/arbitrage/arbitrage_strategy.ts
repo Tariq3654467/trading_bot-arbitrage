@@ -387,12 +387,13 @@ export class ArbitrageStrategy implements ISwapStrategy {
 
           // Collect all opportunity checks for this token/tradeSize to run in parallel
           type CheckTask = {
-            promise: Promise<ReturnType<typeof this.checkArbitrageOpportunity> | null>;
+            promise: Promise<Awaited<ReturnType<typeof ArbitrageStrategy.prototype.checkArbitrageOpportunity>> | null>;
             pair: string;
             description: string;
           };
           
           const checksToRun: CheckTask[] = [];
+          let arbitrageOpportunity: ReturnType<typeof this.checkArbitrageOpportunity> extends Promise<infer T> ? T : null = null;
           
           // For GALA, collect all pairs to check in parallel
           if (tokenName === 'GALA') {
@@ -482,14 +483,14 @@ export class ArbitrageStrategy implements ISwapStrategy {
             const results = await Promise.allSettled(checksToRun.map(check => check.promise));
             
             // Process all results to find the best opportunity
-            let arbitrageOpportunity: ReturnType<typeof this.checkArbitrageOpportunity> extends Promise<infer T> ? T : null = null;
             let gwethCheckFailed = false;
             
-            for (let i = 0; i < results.length; i++) {
+            for (let i = 0; i < results.length && i < checksToRun.length; i++) {
               const result = results[i];
               const check = checksToRun[i];
+              if (!result || !check) continue;
               
-              if (result.status === 'fulfilled' && result.value) {
+              if (result.status === 'fulfilled') {
                 const opportunity = result.value;
                 
                 // Handle GWETH circuit breaker
@@ -618,13 +619,12 @@ export class ArbitrageStrategy implements ISwapStrategy {
             const results = await Promise.allSettled(checksToRun.map(check => check.promise));
             
             // Process all results to find the best opportunity
-            let arbitrageOpportunity: ReturnType<typeof this.checkArbitrageOpportunity> extends Promise<infer T> ? T : null = null;
-            
-            for (let i = 0; i < results.length; i++) {
+            for (let i = 0; i < results.length && i < checksToRun.length; i++) {
               const result = results[i];
               const check = checksToRun[i];
+              if (!result || !check) continue;
               
-              if (result.status === 'fulfilled' && result.value) {
+              if (result.status === 'fulfilled') {
                 const opportunity = result.value;
                 if (opportunity) {
                   logger.info(
@@ -704,13 +704,12 @@ export class ArbitrageStrategy implements ISwapStrategy {
             const results = await Promise.allSettled(checksToRun.map(check => check.promise));
             
             // Process all results to find the best opportunity
-            let arbitrageOpportunity: ReturnType<typeof this.checkArbitrageOpportunity> extends Promise<infer T> ? T : null = null;
-            
-            for (let i = 0; i < results.length; i++) {
+            for (let i = 0; i < results.length && i < checksToRun.length; i++) {
               const result = results[i];
               const check = checksToRun[i];
+              if (!result || !check) continue;
               
-              if (result.status === 'fulfilled' && result.value) {
+              if (result.status === 'fulfilled') {
                 const opportunity = result.value;
                 if (opportunity) {
                   logger.info(
@@ -787,13 +786,12 @@ export class ArbitrageStrategy implements ISwapStrategy {
             const results = await Promise.allSettled(checksToRun.map(check => check.promise));
             
             // Process all results to find the best opportunity
-            let arbitrageOpportunity: ReturnType<typeof this.checkArbitrageOpportunity> extends Promise<infer T> ? T : null = null;
-            
-            for (let i = 0; i < results.length; i++) {
+            for (let i = 0; i < results.length && i < checksToRun.length; i++) {
               const result = results[i];
               const check = checksToRun[i];
+              if (!result || !check) continue;
               
-              if (result.status === 'fulfilled' && result.value) {
+              if (result.status === 'fulfilled') {
                 const opportunity = result.value;
                 if (opportunity) {
                   logger.info(
@@ -824,57 +822,29 @@ export class ArbitrageStrategy implements ISwapStrategy {
               }
             }
           } else if (tokenName === 'GUSDC' || tokenName === 'GUSDT') {
-            // For stablecoins (GUSDC/GUSDT), try GWETH first, then other stablecoin
+            // For stablecoins (GUSDC/GUSDT), collect all pairs to check in parallel
             // Strategy: Sell stablecoin on GalaSwap for GWETH, then buy ETH on Binance and convert back
             if (!shouldSkipGweth) {
-              logger.info(
-                {
-                  token: tokenName,
+              checksToRun.push({
+                promise: this.checkArbitrageOpportunity(
+                  logger,
+                  options.binanceApi,
+                  options.galaChainRouter,
                   tradeSize,
-                  pair: `${tokenName}/GWETH`,
-                },
-                `Arbitrage: Checking ${tokenName} → GWETH opportunity`,
-              );
-              
-              arbitrageOpportunity = await this.checkArbitrageOpportunity(
-                logger,
-                options.binanceApi,
-                options.galaChainRouter,
-                tradeSize,
-                tokenName,
-                'GWETH',
-                'ETHUSDT',
-                'ETHUSDT',
-              );
-              
-              if (arbitrageOpportunity) {
-                logger.info(
-                  {
-                    token: tokenName,
-                    pair: `${tokenName}/GWETH`,
-                    netProfit: arbitrageOpportunity.netProfit.toFixed(4),
-                    tradeSize,
-                    isProfitable: arbitrageOpportunity.netProfit > 0,
-                  },
-                  `Arbitrage: Found ${tokenName} → GWETH opportunity`,
-                );
-              }
+                  tokenName,
+                  'GWETH',
+                  'ETHUSDT',
+                  'ETHUSDT',
+                ),
+                pair: `${tokenName}/GWETH`,
+                description: `${tokenName} → GWETH`,
+              });
             }
             
-            // If GWETH failed or skipped, try other stablecoin
-            if (!arbitrageOpportunity) {
-              const otherStablecoin = tokenName === 'GUSDC' ? 'GUSDT' : 'GUSDC';
-              logger.info(
-                {
-                  token: tokenName,
-                  receivingToken: otherStablecoin,
-                  tradeSize,
-                  binanceSymbol: tokenInfo.binanceSymbol,
-                },
-                `Arbitrage: Checking ${tokenName}/${otherStablecoin} -> ${tokenInfo.binanceSymbol}`,
-              );
-              
-              arbitrageOpportunity = await this.checkArbitrageOpportunity(
+            // Try other stablecoin
+            const otherStablecoin = tokenName === 'GUSDC' ? 'GUSDT' : 'GUSDC';
+            checksToRun.push({
+              promise: this.checkArbitrageOpportunity(
                 logger,
                 options.binanceApi,
                 options.galaChainRouter,
@@ -883,61 +853,129 @@ export class ArbitrageStrategy implements ISwapStrategy {
                 otherStablecoin,
                 tokenInfo.binanceSymbol,
                 'USDT',
-              );
+              ),
+              pair: `${tokenName}/${otherStablecoin}`,
+              description: `${tokenName} → ${otherStablecoin}`,
+            });
+            
+            // Run all checks in parallel
+            logger.info(
+              {
+                token: tokenName,
+                tradeSize,
+                totalChecks: checksToRun.length,
+                pairs: checksToRun.map(c => c.pair),
+              },
+              `Arbitrage: Running ${checksToRun.length} parallel checks for ${tokenName}`,
+            );
+            
+            const results = await Promise.allSettled(checksToRun.map(check => check.promise));
+            
+            // Process all results to find the best opportunity
+            for (let i = 0; i < results.length && i < checksToRun.length; i++) {
+              const result = results[i];
+              const check = checksToRun[i];
+              if (!result || !check) continue;
               
-              if (arbitrageOpportunity) {
-                logger.info(
+              if (result.status === 'fulfilled') {
+                const opportunity = result.value;
+                if (opportunity) {
+                  logger.info(
+                    {
+                      pair: check.pair,
+                      netProfit: opportunity.netProfit.toFixed(4),
+                      tradeSize,
+                      isProfitable: opportunity.netProfit > 0,
+                    },
+                    `Arbitrage: Found ${check.description} opportunity`,
+                  );
+                  
+                  // Select the best opportunity (most profitable)
+                  if (!arbitrageOpportunity || 
+                      (opportunity.netProfit > 0 && (!arbitrageOpportunity.netProfit || arbitrageOpportunity.netProfit <= 0 || opportunity.netProfit > arbitrageOpportunity.netProfit)) ||
+                      (opportunity.netProfit <= 0 && arbitrageOpportunity.netProfit <= 0 && opportunity.netProfit > arbitrageOpportunity.netProfit)) {
+                    arbitrageOpportunity = opportunity;
+                  }
+                }
+              } else if (result.status === 'rejected') {
+                logger.warn(
                   {
-                    token: tokenName,
-                    pair: `${tokenName}/${otherStablecoin} -> ${tokenInfo.binanceSymbol}`,
-                    netProfit: arbitrageOpportunity.netProfit.toFixed(4),
-                    tradeSize,
-                    isProfitable: arbitrageOpportunity.netProfit > 0,
+                    pair: check.pair,
+                    error: result.reason instanceof Error ? result.reason.message : String(result.reason),
                   },
-                  `Arbitrage: Found opportunity for ${tokenName}`,
+                  `Arbitrage: Check failed for ${check.description}`,
                 );
               }
             }
           } else {
-            // For all other tokens, try to sell for stablecoin and buy back on Binance
+            // For all other tokens, collect all pairs to check in parallel
             // Strategy: Sell token on GalaSwap for GUSDC/GUSDT, then buy token on Binance with that USDT value
             const receivingTokens = ['GUSDC', 'GUSDT'];
             
             for (const receivingToken of receivingTokens) {
-              logger.info(
-                {
-                  token: tokenName,
-                  receivingToken,
+              checksToRun.push({
+                promise: this.checkArbitrageOpportunity(
+                  logger,
+                  options.binanceApi,
+                  options.galaChainRouter,
                   tradeSize,
-                  binanceSymbol: tokenInfo.binanceSymbol,
-                },
-                `Arbitrage: Checking ${tokenName}/${receivingToken} -> ${tokenInfo.binanceSymbol}`,
-              );
-              
-              // Check arbitrage: Sell token on GalaSwap for stablecoin, buy token on Binance
-              arbitrageOpportunity = await this.checkArbitrageOpportunity(
-                logger,
-                options.binanceApi,
-                options.galaChainRouter,
+                  tokenName,
+                  receivingToken,
+                  tokenInfo.binanceSymbol,
+                  'USDT',
+                ),
+                pair: `${tokenName}/${receivingToken}`,
+                description: `${tokenName} → ${receivingToken}`,
+              });
+            }
+            
+            // Run all checks in parallel
+            logger.info(
+              {
+                token: tokenName,
                 tradeSize,
-                tokenName,
-                receivingToken,
-                tokenInfo.binanceSymbol,
-                'USDT',
-              );
+                totalChecks: checksToRun.length,
+                pairs: checksToRun.map(c => c.pair),
+              },
+              `Arbitrage: Running ${checksToRun.length} parallel checks for ${tokenName}`,
+            );
+            
+            const results = await Promise.allSettled(checksToRun.map(check => check.promise));
+            
+            // Process all results to find the best opportunity
+            for (let i = 0; i < results.length && i < checksToRun.length; i++) {
+              const result = results[i];
+              const check = checksToRun[i];
+              if (!result || !check) continue;
               
-              if (arbitrageOpportunity) {
-                logger.info(
+              if (result.status === 'fulfilled') {
+                const opportunity = result.value;
+                if (opportunity) {
+                  logger.info(
+                    {
+                      pair: check.pair,
+                      netProfit: opportunity.netProfit.toFixed(4),
+                      tradeSize,
+                      isProfitable: opportunity.netProfit > 0,
+                    },
+                    `Arbitrage: Found ${check.description} opportunity`,
+                  );
+                  
+                  // Select the best opportunity (most profitable)
+                  if (!arbitrageOpportunity || 
+                      (opportunity.netProfit > 0 && (!arbitrageOpportunity.netProfit || arbitrageOpportunity.netProfit <= 0 || opportunity.netProfit > arbitrageOpportunity.netProfit)) ||
+                      (opportunity.netProfit <= 0 && arbitrageOpportunity.netProfit <= 0 && opportunity.netProfit > arbitrageOpportunity.netProfit)) {
+                    arbitrageOpportunity = opportunity;
+                  }
+                }
+              } else if (result.status === 'rejected') {
+                logger.warn(
                   {
-                    token: tokenName,
-                    pair: `${tokenName}/${receivingToken} -> ${tokenInfo.binanceSymbol}`,
-                    netProfit: arbitrageOpportunity.netProfit.toFixed(4),
-                    tradeSize,
-                    isProfitable: arbitrageOpportunity.netProfit > 0,
+                    pair: check.pair,
+                    error: result.reason instanceof Error ? result.reason.message : String(result.reason),
                   },
-                  `Arbitrage: Found opportunity for ${tokenName}`,
+                  `Arbitrage: Check failed for ${check.description}`,
                 );
-                // Continue checking other pairs for this trade size to find the best opportunity
               }
             }
           }
