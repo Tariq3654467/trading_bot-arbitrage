@@ -741,53 +741,25 @@ export class ArbitrageStrategy implements ISwapStrategy {
               }
             }
           } else if (tokenName === 'GSOL') {
-            // For GSOL, try direct GSOL → GALA swap first
-            logger.info(
-              {
-                token: tokenName,
+            // For GSOL, collect all pairs to check in parallel
+            checksToRun.push({
+              promise: this.checkArbitrageOpportunity(
+                logger,
+                options.binanceApi,
+                options.galaChainRouter,
                 tradeSize,
-                pair: 'GSOL/GALA',
-              },
-              `Arbitrage: Checking GSOL → GALA direct swap opportunity`,
-            );
+                'GSOL',
+                'GALA',
+                'GALAUSDT', // Will use GALA → USDT → SOL path on Binance
+                'SOLUSDT', // Use SOLUSDT to get SOL price for comparison
+              ),
+              pair: 'GSOL/GALA',
+              description: 'GSOL → GALA',
+            });
             
-            // Check arbitrage: Sell GSOL on GalaSwap for GALA, then mirror on Binance
-            arbitrageOpportunity = await this.checkArbitrageOpportunity(
-              logger,
-              options.binanceApi,
-              options.galaChainRouter,
-              tradeSize,
-              'GSOL',
-              'GALA',
-              'GALAUSDT', // Will use GALA → USDT → SOL path on Binance
-              'SOLUSDT', // Use SOLUSDT to get SOL price for comparison
-            );
-            
-            if (arbitrageOpportunity) {
-              logger.info(
-                {
-                  token: tokenName,
-                  pair: 'GSOL/GALA',
-                  netProfit: arbitrageOpportunity.netProfit.toFixed(4),
-                  tradeSize,
-                  isProfitable: arbitrageOpportunity.netProfit > 0,
-                },
-                `Arbitrage: Found GSOL → GALA opportunity`,
-              );
-            } else {
-              // Fallback: Try GSOL → GUSDC if direct swap doesn't work
-              // Note: GSOL/GUSDT pool doesn't exist, so only try GUSDC
-              logger.info(
-                {
-                  token: tokenName,
-                  receivingToken: 'GUSDC',
-                  tradeSize,
-                  binanceSymbol: tokenInfo.binanceSymbol,
-                },
-                `Arbitrage: Checking ${tokenName}/GUSDC -> ${tokenInfo.binanceSymbol}`,
-              );
-              
-              arbitrageOpportunity = await this.checkArbitrageOpportunity(
+            // Fallback: Try GSOL → GUSDC (Note: GSOL/GUSDT pool doesn't exist)
+            checksToRun.push({
+              promise: this.checkArbitrageOpportunity(
                 logger,
                 options.binanceApi,
                 options.galaChainRouter,
@@ -796,89 +768,58 @@ export class ArbitrageStrategy implements ISwapStrategy {
                 'GUSDC',
                 tokenInfo.binanceSymbol,
                 'SOLUSDT', // Use SOLUSDT to get SOL price for GSOL → GUSDC conversion
-              );
-              
-              if (arbitrageOpportunity) {
-                logger.info(
-                  {
-                    token: tokenName,
-                    pair: `${tokenName}/GUSDC -> ${tokenInfo.binanceSymbol}`,
-                    netProfit: arbitrageOpportunity.netProfit.toFixed(4),
-                    tradeSize,
-                    isProfitable: arbitrageOpportunity.netProfit > 0,
-                  },
-                  `Arbitrage: Found opportunity for ${tokenName}`,
-                );
-              }
-            }
-          } else if (tokenName === 'GSOL') {
-            // For GSOL, try direct GSOL → GALA swap first
+              ),
+              pair: `${tokenName}/GUSDC`,
+              description: `${tokenName} → GUSDC`,
+            });
+            
+            // Run all checks in parallel
             logger.info(
               {
                 token: tokenName,
                 tradeSize,
-                pair: 'GSOL/GALA',
+                totalChecks: checksToRun.length,
+                pairs: checksToRun.map(c => c.pair),
               },
-              `Arbitrage: Checking GSOL → GALA direct swap opportunity`,
+              `Arbitrage: Running ${checksToRun.length} parallel checks for ${tokenName}`,
             );
             
-            // Check arbitrage: Sell GSOL on GalaSwap for GALA, then mirror on Binance
-            arbitrageOpportunity = await this.checkArbitrageOpportunity(
-              logger,
-              options.binanceApi,
-              options.galaChainRouter,
-              tradeSize,
-              'GSOL',
-              'GALA',
-              'GALAUSDT', // Will use GALA → USDT → SOL path on Binance
-              'SOLUSDT', // Use SOLUSDT to get SOL price for comparison
-            );
+            const results = await Promise.allSettled(checksToRun.map(check => check.promise));
             
-            if (arbitrageOpportunity) {
-              logger.info(
-                {
-                  token: tokenName,
-                  pair: 'GSOL/GALA',
-                  netProfit: arbitrageOpportunity.netProfit.toFixed(4),
-                  tradeSize,
-                  isProfitable: arbitrageOpportunity.netProfit > 0,
-                },
-                `Arbitrage: Found GSOL → GALA opportunity`,
-              );
-            } else {
-              // Fallback: Try GSOL → GUSDC if direct swap doesn't work
-              // Note: GSOL/GUSDT pool doesn't exist, so only try GUSDC
-              logger.info(
-                {
-                  token: tokenName,
-                  receivingToken: 'GUSDC',
-                  tradeSize,
-                  binanceSymbol: tokenInfo.binanceSymbol,
-                },
-                `Arbitrage: Checking ${tokenName}/GUSDC -> ${tokenInfo.binanceSymbol}`,
-              );
+            // Process all results to find the best opportunity
+            let arbitrageOpportunity: ReturnType<typeof this.checkArbitrageOpportunity> extends Promise<infer T> ? T : null = null;
+            
+            for (let i = 0; i < results.length; i++) {
+              const result = results[i];
+              const check = checksToRun[i];
               
-              arbitrageOpportunity = await this.checkArbitrageOpportunity(
-                logger,
-                options.binanceApi,
-                options.galaChainRouter,
-                tradeSize,
-                tokenName,
-                'GUSDC',
-                tokenInfo.binanceSymbol,
-                'SOLUSDT', // Use SOLUSDT to get SOL price for GSOL → GUSDC conversion
-              );
-              
-              if (arbitrageOpportunity) {
-                logger.info(
+              if (result.status === 'fulfilled' && result.value) {
+                const opportunity = result.value;
+                if (opportunity) {
+                  logger.info(
+                    {
+                      pair: check.pair,
+                      netProfit: opportunity.netProfit.toFixed(4),
+                      tradeSize,
+                      isProfitable: opportunity.netProfit > 0,
+                    },
+                    `Arbitrage: Found ${check.description} opportunity`,
+                  );
+                  
+                  // Select the best opportunity (most profitable)
+                  if (!arbitrageOpportunity || 
+                      (opportunity.netProfit > 0 && (!arbitrageOpportunity.netProfit || arbitrageOpportunity.netProfit <= 0 || opportunity.netProfit > arbitrageOpportunity.netProfit)) ||
+                      (opportunity.netProfit <= 0 && arbitrageOpportunity.netProfit <= 0 && opportunity.netProfit > arbitrageOpportunity.netProfit)) {
+                    arbitrageOpportunity = opportunity;
+                  }
+                }
+              } else if (result.status === 'rejected') {
+                logger.warn(
                   {
-                    token: tokenName,
-                    pair: `${tokenName}/GUSDC -> ${tokenInfo.binanceSymbol}`,
-                    netProfit: arbitrageOpportunity.netProfit.toFixed(4),
-                    tradeSize,
-                    isProfitable: arbitrageOpportunity.netProfit > 0,
+                    pair: check.pair,
+                    error: result.reason instanceof Error ? result.reason.message : String(result.reason),
                   },
-                  `Arbitrage: Found opportunity for ${tokenName}`,
+                  `Arbitrage: Check failed for ${check.description}`,
                 );
               }
             }
