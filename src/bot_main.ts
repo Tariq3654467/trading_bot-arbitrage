@@ -7,7 +7,6 @@ import { MongoAcceptedSwapStore } from './dependencies/accepted_swap_store.js';
 import { BinanceApi } from './dependencies/binance/binance_api.js';
 import { BinanceTrading, IBinanceTradingConfig } from './dependencies/binance/binance_trading.js';
 import { MongoCreatedSwapStore } from './dependencies/created_swap_store.js';
-import { GalaDeFiApi } from './dependencies/galadefi/galadefi_api.js';
 import { GalaSwapApi } from './dependencies/galaswap/galaswap_api.js';
 import { GalaChainRouter } from './dependencies/onchain/galachain_router.js';
 import { MongoPriceStore } from './dependencies/price_store.js';
@@ -49,7 +48,6 @@ async function main(logger: ILogger) {
 
   // GalaSwap API - Updated 2025 GalaChain API
   // Uses the new GalaChain 2.0 API endpoints (/v1/token-contract/, etc.)
-  // For new HFT DEX trading, use GalaDeFi API instead
   const galaSwapApiBaseUri = await configuration.getOptionalWithDefault(
     'GALASWAP_API_BASE_URI',
     'https://api-galaswap.gala.com', // Updated 2025 GalaChain Gateway API
@@ -63,19 +61,6 @@ async function main(logger: ILogger) {
     await configuration.getOptionalWithDefault('GALASWAP_CONNECT_TIMEOUT_MS', '15000'),
   );
 
-  // GalaDeFi DEX API configuration
-  // NOTE: DEX API is NOT officially supported by Gala. Use on-chain router (gSwap SDK) instead.
-  // This is kept for backward compatibility only but should NOT be used for creating swaps.
-  const galaDeFiEnabled = (await configuration.getOptionalWithDefault('GALADEFI_ENABLED', 'false')) === 'true';
-  if (galaDeFiEnabled) {
-    logger.warn(
-      'GALADEFI_ENABLED=true is set, but the old DEX API is NOT used for creating swaps. The bot uses the official Gala gSwap SDK (via GALA_RPC_URL) for all swap creation.',
-    );
-  }
-  const galaDeFiApiBaseUri = await configuration.getOptionalWithDefault(
-    'GALADEFI_API_BASE_URI',
-    'https://dex-backend-prod1.defi.gala.com', // HFT DEX API endpoint (not used for swaps)
-  );
 
   // Blockchain RPC Provider (MANDATORY for on-chain trading)
   // Used for: swap transactions via GalaChain chaincode contracts
@@ -185,14 +170,6 @@ async function main(logger: ILogger) {
     },
   );
 
-  // Initialize GalaDeFi DEX API if enabled
-  const galaDeFiApi = galaDeFiEnabled
-    ? new GalaDeFiApi(galaDeFiApiBaseUri, selfWalletAddress, selfPrivateKey, fetch, logger)
-    : null;
-
-  if (galaDeFiApi) {
-    logger.info('GalaDeFi DEX API enabled and initialized');
-  }
 
   // Initialize Binance API if enabled
   let binanceApi: BinanceApi | null = null;
@@ -314,7 +291,6 @@ async function main(logger: ILogger) {
         ignoreSwapsCreatedBefore,
         binanceApi,
         binanceTrading,
-        galaDeFiApi,
         galaChainRouter,
         tokenConfig: defaultTokenConfig,
       },

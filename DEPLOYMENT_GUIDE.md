@@ -24,8 +24,6 @@ GALASWAP_CONTRACT_NAME=galachain-gala-swap
 ```bash
 # API Configuration
 GALASWAP_API_BASE_URI=https://api-galaswap.gala.com
-GALADEFI_ENABLED=false
-GALADEFI_API_BASE_URI=https://dex-backend-prod1.defi.gala.com
 
 # Timing Configuration
 LOOP_WAIT_MS=15000

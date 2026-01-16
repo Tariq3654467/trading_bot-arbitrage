@@ -5,7 +5,6 @@ import { IBinanceApi } from './dependencies/binance/binance_api.js';
 import { BinanceTrading } from './dependencies/binance/binance_trading.js';
 import { IBinanceTokenMappingConfig } from './dependencies/binance/token_mapping.js';
 import { MongoCreatedSwapStore } from './dependencies/created_swap_store.js';
-import { IGalaDeFiApi } from './dependencies/galadefi/galadefi_api.js';
 import { IGalaSwapApi, IGalaSwapToken, IRawSwap, ITokenBalance } from './dependencies/galaswap/types.js';
 import { GalaChainRouter } from './dependencies/onchain/galachain_router.js';
 import { aggregatePrices, IEnhancedTokenPrice } from './dependencies/price_aggregator.js';
@@ -61,7 +60,6 @@ export async function mainLoopTick(
     binanceApi?: IBinanceApi | null;
     binanceMappingConfig?: IBinanceTokenMappingConfig;
     binanceTrading?: BinanceTrading | null;
-    galaDeFiApi?: IGalaDeFiApi | null;
     galaChainRouter?: GalaChainRouter | null;
   } = {},
 ) {
@@ -389,7 +387,6 @@ export async function mainLoopTick(
         await sleep(executionDelay);
 
         // IMPORTANT: Only use official Gala gSwap SDK (via galaChainRouter)
-        // DO NOT use the old DEX API (galaDeFiApi) - it's not officially supported by Gala
         // DO NOT fallback to REST API (order book) - only use official gSwap SDK
 
         if (options.galaChainRouter) {

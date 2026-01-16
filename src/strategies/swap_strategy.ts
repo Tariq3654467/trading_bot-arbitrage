@@ -11,7 +11,6 @@ import { IStatusReporter } from '../dependencies/status_reporters.js';
 import { ILogger } from '../types/types.js';
 import { IBinanceApi } from '../dependencies/binance/binance_api.js';
 import { BinanceTrading } from '../dependencies/binance/binance_trading.js';
-import { IGalaDeFiApi } from '../dependencies/galadefi/galadefi_api.js';
 import { GalaChainRouter } from '../dependencies/onchain/galachain_router.js';
 
 export type ISwapToCreate = Pick<IRawSwap, 'offered' | 'wanted' | 'uses'>;
@@ -39,7 +38,6 @@ export interface ISwapStrategy {
       now?: Date;
       binanceApi?: IBinanceApi | null;
       binanceTrading?: BinanceTrading | null;
-      galaDeFiApi?: IGalaDeFiApi | null;
       galaChainRouter?: GalaChainRouter | null;
     },
   ): Promise<{

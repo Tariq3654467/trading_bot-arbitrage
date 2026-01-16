@@ -91,7 +91,6 @@ export class ArbitrageStrategy implements ISwapStrategy {
       now?: Date;
       binanceApi?: IBinanceApi | null;
       binanceTrading?: BinanceTrading | null;
-      galaDeFiApi?: any;
       galaChainRouter?: GalaChainRouter | null;
       tokenConfig?: ITokenConfig;
       binanceMappingConfig?: IBinanceTokenMappingConfig;
@@ -272,6 +271,21 @@ export class ArbitrageStrategy implements ISwapStrategy {
         token: string;
       }> = [];
 
+      // Collect all opportunity checks to run in parallel
+      type OpportunityCheck = {
+        tokenName: string;
+        tradeSize: number;
+        galaToken: string;
+        receivingToken: string;
+        binanceSymbol: string;
+        quoteCurrency: string;
+        direction: 'GalaSwap->Binance' | 'Binance->GalaSwap';
+        tokenInfo: typeof filteredArbitrageableTokens[0];
+      };
+
+      const opportunityChecks: OpportunityCheck[] = [];
+      const now = Date.now();
+
       // Check arbitrage opportunities for each token that has a Binance mapping
       // ✅ All tokens with Binance mappings are processed (GALA, GWETH, GWBTC, GSOL, GUSDC, GUSDT, and others)
       // All pairs use 1% fee tier (10000) as per user requirement
@@ -358,7 +372,6 @@ export class ArbitrageStrategy implements ISwapStrategy {
         );
 
         // Check if we should skip GWETH due to recent failures (circuit breaker)
-        const now = Date.now();
         const shouldSkipGweth = tokenName === 'GALA' && 
                                 this.gwethFailureCount >= this.GWETH_MAX_FAILURES && 
                                 (now - this.gwethLastFailureTime) < this.GWETH_RETRY_INTERVAL;
@@ -375,7 +388,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
           );
         }
 
-        // Try each trade size to find the most profitable opportunity for this token
+        // Collect all opportunity checks for this token to run in parallel
         for (const tradeSize of validSizes) {
           logger.info(
             {
@@ -1217,7 +1230,7 @@ export class ArbitrageStrategy implements ISwapStrategy {
               ? ((this.ALLOW_LOSS_TRADES || isGalaToGweth)
                   ? `Trade would result in LOSS but ${isGalaToGweth ? 'GALA/GWETH allows small losses' : 'ALLOW_LOSS_TRADES is enabled'} - should execute but opportunity not selected`
                   : 'Trade would result in LOSS - not executing (ALLOW_LOSS_TRADES disabled)')
-              : `Profit (${bestOpportunity.netProfit.toFixed(4)}) below minimum threshold (${minProfitRequired})`,
+              : `Profit (${bestOpportunity.netProfit.toFixed(4)}) - will execute (any profit > 0 is allowed)`,
           },
           'Arbitrage: Opportunity found but not executing',
         );
@@ -1285,11 +1298,18 @@ export class ArbitrageStrategy implements ISwapStrategy {
       
       // Always log a summary at the end of each check
       const tokensChecked = arbitrageableTokens.map(t => t.balance.collection);
+      const profitableOpps = allOpportunities.filter(o => o.netProfit > 0);
+      const unprofitableOpps = allOpportunities.filter(o => o.netProfit <= 0);
       logger.info(
         {
           totalOpportunitiesChecked: allOpportunities.length,
-          profitableOpportunities: allOpportunities.filter(o => o.netProfit > 0 && o.netProfit >= this.MIN_PROFIT_GALA).length,
-          unprofitableOpportunities: allOpportunities.filter(o => o.netProfit <= 0).length,
+          profitableOpportunities: profitableOpps.length,
+          profitableDetails: profitableOpps.length > 0 ? profitableOpps.map(o => ({
+            pair: o.pair,
+            tradeSize: o.tradeSize,
+            netProfit: o.netProfit.toFixed(4),
+          })) : 'None found',
+          unprofitableOpportunities: unprofitableOpps.length,
           tokensChecked: tokensChecked,
           uniqueTokens: [...new Set(tokensChecked)],
           nextCheckIn: `${Math.round(this.ARBITRAGE_CHECK_INTERVAL / 1000)}s`,

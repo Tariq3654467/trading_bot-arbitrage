@@ -69,7 +69,6 @@ export class BinanceTradingStrategy implements ISwapStrategy {
       now?: Date;
       binanceApi?: import('../../dependencies/binance/binance_api.js').IBinanceApi | null;
       binanceTrading?: import('../../dependencies/binance/binance_trading.js').BinanceTrading | null;
-      galaDeFiApi?: import('../../dependencies/galadefi/galadefi_api.js').IGalaDeFiApi | null;
       galaChainRouter?: import('../../dependencies/onchain/galachain_router.js').GalaChainRouter | null;
     },
   ): ReturnType<ISwapStrategy['doTick']> {
